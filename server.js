@@ -406,38 +406,7 @@ async function syncSubscriptionsFromGHL(locationId) {
         fetchGHLAffiliates(locationId)
     ]);
 
-    // Step 2: Build contactId → affiliate mapping
-    // 2a. From GHL payment transactions — transactions that have a subscriptionId
-    //     and whose contact matches an affiliate we know.
-    //     We cross-reference by the contactId field on the transaction.
-    //     GHL doesn't directly expose "this transaction came from affiliate X" in the
-    //     payments API, BUT the affiliate manager tracks customers internally.
-    //     We also use our own webhook records (contactAffiliateMap) built at purchase time.
-
-    // 2b. From our webhook records (already in db.contactAffiliateMap) — keep those
     const contactMap = { ...db.contactAffiliateMap };
-
-    // 2c. Also look at transactions fetched from GHL: if ANY of our affiliates' names
-    //     appear in the transaction metadata / source, try to map it.
-    //     Build a quick name→affiliate lookup
-    const affiliateByName = {};
-    const affiliateByEmail = {};
-    affiliates.forEach(a => {
-        if (a.name)  affiliateByName[a.name.toLowerCase()]  = a;
-        if (a.email) affiliateByEmail[a.email.toLowerCase()] = a;
-    });
-
-    // Step 3: Group transactions by subscriptionId so we can find the
-    // originating transaction for each subscription.
-    const txnsBySubId = {};
-    ghlTxns.forEach(t => {
-        const sid = t.subscriptionId;
-        if (!sid) return;
-        if (!txnsBySubId[sid]) txnsBySubId[sid] = [];
-        txnsBySubId[sid].push(t);
-    });
-
-    // Step 4: Process each subscription
     const results = { locationId, added: [], updated: [], skipped: [], rawCount: ghlSubs.length };
 
     for (const sub of ghlSubs) {
@@ -465,15 +434,15 @@ async function syncSubscriptionsFromGHL(locationId) {
 
         // 4. Force Generate Missing Transactions!
         const txId = `tx_sync_${ghlSubId}`;
-        if (!db.transactions[txId] && affiliateRec && productId) {
+        if (!db.transactions[txId] && productId) {
             const rule = db.products[productId];
             if (rule && rule.payoutValue > 0) {
                 db.transactions[txId] = {
                     id: txId, 
-                    campaignId: rule.campaignId || affiliateRec.campaignId || 'unknown',
+                    campaignId: rule.campaignId || affiliateRec?.campaignId || 'unknown',
                     contactId: contactId,
-                    affiliateId: affiliateRec.id,          // Store ID for strict matching
-                    affiliateName: affiliateRec.name,
+                    affiliateId: affiliateRec?.id || payloadAffId || null,
+                    affiliateName: affiliateRec?.name || payloadAffId || 'Unknown Affiliate',
                     productId: productId,
                     subscriptionId: ghlSubId,
                     type: rule.payoutType || 'CASH',       // Maps LEAD or CASH
@@ -512,118 +481,13 @@ async function syncSubscriptionsFromGHL(locationId) {
         else results.updated.push(ghlSubId);
     }
 
-        // If not found via contact map, check if transactions for this sub mention an affiliate
-        if (!affiliateEntry) {
-            const relatedTxns = txnsBySubId[subStripeId] || txnsBySubId[ghlSubId] || [];
-            for (const t of relatedTxns) {
-                // Look for affiliate info in transaction source metadata
-                const metaStr = JSON.stringify(t).toLowerCase();
-                for (const [name, aff] of Object.entries(affiliateByName)) {
-                    if (metaStr.includes(name)) {
-                        affiliateEntry = { affiliateId: aff.id, affiliateName: aff.name, locationId };
-                        // Remember for future
-                        if (contactId) contactMap[contactId] = affiliateEntry;
-                        break;
-                    }
-                }
-                if (affiliateEntry) break;
-            }
-        }
-
-        // Detect billing interval
-        const billingInterval = detectBillingInterval(sub);
-        const intervalMs      = intervalToMs(billingInterval);
-
-        // Determine current period end / renewal date
-        // GHL might have currentPeriodEnd, or we estimate from createdAt + interval
-        const createdAt       = sub.createdAt || new Date().toISOString();
-        const rawPeriodEnd    = sub.currentPeriodEnd || sub.nextBillingDate || null;
-        const periodEndMs     = rawPeriodEnd
-            ? new Date(rawPeriodEnd).getTime()
-            : new Date(createdAt).getTime() + intervalMs;
-        const renewalDate     = new Date(periodEndMs).toISOString();
-        const nextCheckDate   = calcNextCheckDate(renewalDate);
-
-        const existing = db.trackedSubscriptions[ghlSubId];
-
-        // NEW: Grab the Product ID from the subscription and apply custom rules!
-        const productId = sub.recurringProduct?.product?._id || sub.productId;
-        
-        if (!existing && affiliateEntry && productId) {
-            const rule = db.products[productId];
-            // If a rule exists and has a value, generate the initial transaction
-            if (rule && rule.payoutValue > 0) {
-                const txId = `tx_sync_${ghlSubId}`;
-                db.transactions[txId] = {
-                    id: txId, 
-                    campaignId: rule.campaignId || affiliateEntry.campaignId || 'unknown',
-                    contactId: contactId,
-                    affiliateName: affiliateEntry.affiliateName,
-                    productId: productId,
-                    subscriptionId: ghlSubId,
-                    type: rule.payoutType || 'CASH', // This applies 'LEAD' if configured!
-                    amount: rule.payoutValue,
-                    createdAt: sub.createdAt || new Date().toISOString()
-                };
-            }
-        }
-
-        // Always store the subscription (affiliated or not) so admin can see raw data.
-        // Only active-status check is gated on affiliate association.
-
-        // Always store the subscription (affiliated or not) so admin can see raw data.
-        // Only active-status check is gated on affiliate association.
-        const record = {
-            ghlSubId,
-            stripeSubId:     subStripeId,
-            contactId,
-            contactEmail,
-            contactName:     sub.contactName || '',
-            locationId,
-            // Affiliate info (null if unaffiliated)
-            affiliateId:     affiliateEntry?.affiliateId   || null,
-            affiliateName:   affiliateEntry?.affiliateName || null,
-            isAffiliated:    !!affiliateEntry,
-            // Billing
-            billingInterval,
-            amount:          sub.amount   || 0,
-            currency:        sub.currency || 'USD',
-            // Status
-            status,
-            isActive:        status === 'active',
-            // Period tracking
-            startDate:       existing?.startDate || createdAt,
-            renewalDate,
-            nextCheckDate:   existing?.nextCheckDate || nextCheckDate,
-            lastChecked:     existing?.lastChecked  || null,
-            checkCount:      existing?.checkCount   || 0,
-            stopped:         existing?.stopped      || false,
-            // Raw snapshot for debugging — lets admin see all fields
-            _raw:            { entityType: sub.entityType, entitySourceType: sub.entitySourceType,
-                               entitySourceName: sub.entitySourceName, liveMode: sub.liveMode }
-        };
-
-        // Don't overwrite nextCheckDate if we already have a future one scheduled
-        if (existing?.nextCheckDate && !existing?.stopped) {
-            record.nextCheckDate = existing.nextCheckDate;
-        }
-
-        db.trackedSubscriptions[ghlSubId] = record;
-
-        if (!existing) {
-            results.added.push({ ghlSubId, contact: contactEmail || contactId, affiliated: record.isAffiliated, interval: billingInterval });
-        } else {
-            results.updated.push(ghlSubId);
-        }
-    }
-
     // Persist updated contact map
     db.contactAffiliateMap = contactMap;
     saveDB(db);
 
     console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${ghlSubs.length} total`);
     return results;
-
+}
 
 // ─── Per-subscription renewal check ──────────────────────────────────────────
 // Called by the hourly cron and the manual admin trigger.
@@ -818,12 +682,17 @@ app.get('/api/dashboard/:campaignId', async (req, res) => {
 
     // OVERRIDE native GHL stats with your custom Product Rules
     affiliates.forEach(aff => {
-        const affTxns = allCampaignTxns.filter(t => t.affiliateName?.toLowerCase() === aff.name?.toLowerCase());
+        // Match by ID primarily, fallback to Name, or match GHL's weird short-codes
+        const affTxns = allCampaignTxns.filter(t => 
+            (t.affiliateId && t.affiliateId === aff.id) || 
+            (t.affiliateName && t.affiliateName.toLowerCase() === aff.name?.toLowerCase()) ||
+            (t.affiliateId && aff.email && aff.email.toLowerCase().includes(t.affiliateId.toLowerCase().replace(/[0-9]/g, '')))
+        );
         
         // Sum up CASH rules and LEAD rules separately
         aff.totalCash  = affTxns.filter(t => t.type === 'CASH').reduce((sum, t) => sum + Number(t.amount || 0), 0);
         aff.totalLeads = affTxns.filter(t => t.type === 'LEAD').reduce((sum, t) => sum + Number(t.amount || 0), 0);
-        aff.customer   = affTxns.length; // Total transaction count
+        aff.customer   = affTxns.length > 0 ? affTxns.length : (aff.customer || 0); // Keep native sale count if no custom txns exist
     });
 
     const recentTransactions = allCampaignTxns
