@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+
+# Local Database (contains live OAuth tokens)
+leaf_database.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
