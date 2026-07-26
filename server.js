@@ -442,13 +442,75 @@ async function syncSubscriptionsFromGHL(locationId) {
 
     for (const sub of ghlSubs) {
         const ghlSubId    = sub._id || sub.id;
-        const subStripeId = sub.subscriptionId || '';  // e.g. sub_1KGcXDCScnf89tZoVkoEMCEL
+        const subStripeId = sub.subscriptionId || ''; 
         const contactId   = sub.contactId   || '';
         const contactEmail = sub.contactEmail || '';
         const status      = (typeof sub.status === 'object' ? sub.status?.status : sub.status) || 'unknown';
 
-        // Identify affiliate for this subscription
+        // 1. Grab Product ID directly from the nested payload
+        const productId = sub.recurringProduct?.product?._id || sub.productId;
+
+        // 2. Identify Affiliate directly from the nested payload
+        const payloadAffId = sub.entitySourceMeta?.affiliateManager?.id;
+        let affiliateRec = null;
+        if (payloadAffId) {
+            affiliateRec = Object.values(db.affiliates).find(a => a.id === payloadAffId || a.refId === payloadAffId);
+        }
+
+        // 3. Fallbacks if not found directly
         let affiliateEntry = contactMap[contactId] || (contactEmail && contactMap[contactEmail]) || null;
+        if (!affiliateRec && affiliateEntry) {
+            affiliateRec = Object.values(db.affiliates).find(a => a.id === affiliateEntry.affiliateId);
+        }
+
+        // 4. Force Generate Missing Transactions!
+        const txId = `tx_sync_${ghlSubId}`;
+        if (!db.transactions[txId] && affiliateRec && productId) {
+            const rule = db.products[productId];
+            if (rule && rule.payoutValue > 0) {
+                db.transactions[txId] = {
+                    id: txId, 
+                    campaignId: rule.campaignId || affiliateRec.campaignId || 'unknown',
+                    contactId: contactId,
+                    affiliateId: affiliateRec.id,          // Store ID for strict matching
+                    affiliateName: affiliateRec.name,
+                    productId: productId,
+                    subscriptionId: ghlSubId,
+                    type: rule.payoutType || 'CASH',       // Maps LEAD or CASH
+                    amount: rule.payoutValue,              // Maps your custom amount
+                    createdAt: sub.createdAt || new Date().toISOString()
+                };
+            }
+        }
+
+        // Detect billing interval
+        const billingInterval = detectBillingInterval(sub);
+        const intervalMs      = intervalToMs(billingInterval);
+        const createdAt       = sub.createdAt || new Date().toISOString();
+        const rawPeriodEnd    = sub.currentPeriodEnd || sub.nextBillingDate || null;
+        const periodEndMs     = rawPeriodEnd ? new Date(rawPeriodEnd).getTime() : new Date(createdAt).getTime() + intervalMs;
+        const renewalDate     = new Date(periodEndMs).toISOString();
+        const nextCheckDate   = calcNextCheckDate(renewalDate);
+
+        const existing = db.trackedSubscriptions[ghlSubId];
+
+        const record = {
+            ghlSubId, stripeSubId: subStripeId, contactId, contactEmail, contactName: sub.contactName || '', locationId,
+            affiliateId: affiliateRec?.id || null,
+            affiliateName: affiliateRec?.name || null,
+            isAffiliated: !!affiliateRec,
+            billingInterval, amount: sub.amount || 0, currency: sub.currency || 'USD', status, isActive: status === 'active',
+            startDate: existing?.startDate || createdAt, renewalDate, 
+            nextCheckDate: existing?.nextCheckDate || nextCheckDate,
+            lastChecked: existing?.lastChecked || null, checkCount: existing?.checkCount || 0, stopped: existing?.stopped || false
+        };
+
+        if (existing?.nextCheckDate && !existing?.stopped) record.nextCheckDate = existing.nextCheckDate;
+
+        db.trackedSubscriptions[ghlSubId] = record;
+        if (!existing) results.added.push({ ghlSubId, contact: contactEmail || contactId, affiliated: record.isAffiliated });
+        else results.updated.push(ghlSubId);
+    }
 
         // If not found via contact map, check if transactions for this sub mention an affiliate
         if (!affiliateEntry) {
@@ -561,7 +623,7 @@ async function syncSubscriptionsFromGHL(locationId) {
 
     console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${ghlSubs.length} total`);
     return results;
-}
+
 
 // ─── Per-subscription renewal check ──────────────────────────────────────────
 // Called by the hourly cron and the manual admin trigger.
