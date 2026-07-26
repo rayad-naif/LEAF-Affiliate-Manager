@@ -451,28 +451,43 @@ function normalize(str) {
 }
 
 // ─── Match a subscription to a known affiliate ────────────────────────────────
+// IMPORTANT: `affiliates` passed in MUST already be scoped to the current
+// locationId. Demo/seed affiliates (aff_1/aff_2/aff_3 from seedDB) have no
+// locationId set at all, so a proper scoped list excludes them automatically
+// — this is what stops a real subscription from ever matching leftover fake
+// "Alex Rivera"-style seed data from an unrelated location.
+//
 // Tries, in priority order:
-//   1. Exact ID match via entitySourceMeta.affiliateManager.id
-//   2. Known contactId/contactEmail → affiliate mapping (built by prior syncs/webhooks)
+//   1. Exact ID match via entitySourceMeta.affiliateManager.id (or refId)
+//   2. Known contactId/contactEmail → affiliate mapping — but only if that
+//      cached affiliateId still exists within THIS location's scoped roster.
+//      A cached mapping pointing at an affiliate outside this location is
+//      treated as stale and discarded rather than trusted.
 //   3. Fuzzy match: normalize everything we know about the subscription
 //      (contact name/email + related transaction metadata) into one haystack,
-//      then check whether any affiliate's normalized name, email, or refId
-//      shows up in it.
+//      then check whether any affiliate's normalized name, full email, or
+//      referral code shows up in it. Only the email LOCAL PART is used if
+//      it's long enough (>=5 normalized chars) to avoid short-string false
+//      positives like "alex" matching unrelated text.
+// Returns { affiliate, source } where source is 'direct-id' | 'known-mapping' | 'fuzzy' | null,
+// so callers/debug tooling can see exactly why (or why not) a match happened.
 function matchAffiliate({ sub, affiliates, contactMap, relatedTxns }) {
     // 1. Direct ID match — GHL told us exactly which affiliate this is
     const payloadAffId = sub.entitySourceMeta?.affiliateManager?.id;
     if (payloadAffId) {
         const direct = affiliates.find(a => a.id === payloadAffId || a.refId === payloadAffId);
-        if (direct) return direct;
+        if (direct) return { affiliate: direct, source: 'direct-id' };
     }
 
-    // 2. Known contact → affiliate mapping from previous syncs/webhooks
+    // 2. Known contact → affiliate mapping — only trusted if it resolves
+    //    within THIS location's scoped affiliate list
     const contactId    = sub.contactId    || '';
     const contactEmail = sub.contactEmail || '';
     const mapped = contactMap[contactId] || (contactEmail && contactMap[contactEmail]);
     if (mapped?.affiliateId) {
         const byId = affiliates.find(a => a.id === mapped.affiliateId);
-        if (byId) return byId;
+        if (byId) return { affiliate: byId, source: 'known-mapping' };
+        // mapping points at an affiliate not in this location's roster — stale, ignore it
     }
 
     // 3. Fuzzy match against name / email / referral code
@@ -484,27 +499,34 @@ function matchAffiliate({ sub, affiliates, contactMap, relatedTxns }) {
 
     if (haystack) {
         const fuzzy = affiliates.find(a => {
-            const aName  = normalize(a.name);
-            const aEmail = normalize((a.email || '').split('@')[0]); // local part only
-            const aRef   = normalize(a.refId);
-            return (aName  && haystack.includes(aName)) ||
-                   (aEmail && haystack.includes(aEmail)) ||
-                   (aRef   && haystack.includes(aRef));
+            const aName     = normalize(a.name);
+            const aEmailFull = normalize(a.email || '');
+            const aEmailLocal = normalize((a.email || '').split('@')[0]);
+            const aRef      = normalize(a.refId);
+            // Require a minimum token length before allowing a substring match —
+            // short tokens like "alex" (4 chars) cause false positives.
+            const emailToken = aEmailLocal.length >= 5 ? aEmailLocal : null;
+            return (aName      && aName.length >= 5 && haystack.includes(aName)) ||
+                   (aEmailFull && haystack.includes(aEmailFull)) ||
+                   (emailToken && haystack.includes(emailToken)) ||
+                   (aRef       && aRef.length >= 5 && haystack.includes(aRef));
         });
-        if (fuzzy) return fuzzy;
+        if (fuzzy) return { affiliate: fuzzy, source: 'fuzzy' };
     }
 
-    return null;
+    return { affiliate: null, source: null };
 }
 
 // ─── Sync subscriptions from GHL and match to affiliates ─────────────────────
 // This is the core of the system.
 // Steps:
 //   1. Fetch all GHL subscriptions, transactions, and affiliates for the location
-//   2. For each subscription: match an affiliate (ID → known mapping → fuzzy),
+//   2. Scope the affiliate candidate list to THIS location only (never match
+//      against seed/demo data or affiliates belonging to other locations)
+//   3. For each subscription: match an affiliate (ID → known mapping → fuzzy),
 //      force-generate the initial purchase transaction if missing, compute
 //      billing interval + renewal/check dates, and upsert into trackedSubscriptions
-//   3. Persist everything in one save, with per-subscription error isolation so
+//   4. Persist everything in one save, with per-subscription error isolation so
 //      one bad record can never abort the whole sync
 async function syncSubscriptionsFromGHL(locationId) {
     const db = loadDB();
@@ -522,8 +544,13 @@ async function syncSubscriptionsFromGHL(locationId) {
     ]);
 
     // Merge freshly-fetched affiliates into the local store so IDs/refIds are current
-    ghlAffiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a }; });
-    const affiliates = Object.values(db.affiliates);
+    ghlAffiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a, locationId }; });
+
+    // ── Scope candidates to THIS location only ──────────────────────────────
+    // Seed/demo affiliates (aff_1/aff_2/aff_3) have no locationId field at
+    // all, so this filter excludes them by construction — they can never be
+    // matched against a real subscription again.
+    const affiliates = Object.values(db.affiliates).filter(a => a.locationId === locationId);
 
     // Group transactions by subscriptionId so fuzzy matching can inspect related metadata
     const txnsBySubId = {};
@@ -552,10 +579,11 @@ async function syncSubscriptionsFromGHL(locationId) {
             const status       = (typeof sub.status === 'object' ? sub.status?.status : sub.status) || 'unknown';
             const productId    = sub.recurringProduct?.product?._id || sub.productId || null;
 
-            const relatedTxns  = txnsBySubId[subStripeId] || txnsBySubId[ghlSubId] || [];
-            const affiliateRec = matchAffiliate({ sub, affiliates, contactMap, relatedTxns });
+            const relatedTxns = txnsBySubId[subStripeId] || txnsBySubId[ghlSubId] || [];
+            const { affiliate: affiliateRec, source: matchSource } = matchAffiliate({ sub, affiliates, contactMap, relatedTxns });
 
             // Remember this mapping so future syncs/checks resolve instantly
+            // (only cache real, scoped matches — never cache a "no match")
             if (affiliateRec && contactId) {
                 contactMap[contactId] = { affiliateId: affiliateRec.id, affiliateName: affiliateRec.name, locationId };
             }
@@ -600,6 +628,7 @@ async function syncSubscriptionsFromGHL(locationId) {
                 affiliateId:   affiliateRec?.id   || null,
                 affiliateName: affiliateRec?.name || null,
                 isAffiliated:  !!affiliateRec,
+                matchSource,   // 'direct-id' | 'known-mapping' | 'fuzzy' | null — for debugging
                 billingInterval,
                 amount:   sub.amount   || 0,
                 currency: sub.currency || 'USD',
@@ -1178,6 +1207,96 @@ app.post('/api/sync-subscriptions/:locationId', async (req, res) => {
         console.error('[sync-subs] error:', err.response?.data || err.message);
         res.status(500).json({ success: false, error: err.response?.data?.message || err.message });
     }
+});
+
+// ─── API: Debug a single subscription's affiliate match ──────────────────────
+// Fetches the raw live subscription from GHL and re-runs the same matching
+// logic used during sync, returning exactly which step matched (or why
+// nothing matched) — for tracking down mismatches like a subscription
+// resolving to the wrong affiliate, or not resolving at all.
+app.get('/api/debug-subscription/:locationId/:ghlSubId', async (req, res) => {
+    const { locationId, ghlSubId } = req.params;
+    try {
+        const db = loadDB();
+        const [sub, ghlTxns, ghlAffiliates] = await Promise.all([
+            fetchGHLSubscriptionById(locationId, ghlSubId),
+            fetchGHLTransactions(locationId),
+            fetchGHLAffiliates(locationId)
+        ]);
+
+        // Same scoping as the real sync — only this location's affiliates are candidates
+        ghlAffiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a, locationId }; });
+        const affiliates = Object.values(db.affiliates).filter(a => a.locationId === locationId);
+
+        const subStripeId = sub.subscriptionId || '';
+        const relatedTxns = ghlTxns.filter(t => t.subscriptionId === subStripeId || t.subscriptionId === ghlSubId);
+
+        const contactMap = db.contactAffiliateMap || {};
+        const cachedMapping = contactMap[sub.contactId] || contactMap[sub.contactEmail] || null;
+
+        const { affiliate, source } = matchAffiliate({ sub, affiliates, contactMap, relatedTxns });
+
+        res.json({
+            success: true,
+            rawSubscription: sub,
+            relatedTransactions: relatedTxns,
+            scopedAffiliateCount: affiliates.length,
+            scopedAffiliates: affiliates.map(a => ({ id: a.id, name: a.name, email: a.email, refId: a.refId })),
+            cachedContactMapping: cachedMapping,
+            matchResult: { matchedAffiliateId: affiliate?.id || null, matchedAffiliateName: affiliate?.name || null, source }
+        });
+    } catch (err) {
+        console.error('[debug-subscription] error:', err.response?.data || err.message);
+        res.status(500).json({ success: false, error: err.response?.data?.message || err.message });
+    }
+});
+
+// ─── API: Purge stale/demo data ───────────────────────────────────────────────
+// Removes any affiliate record with no locationId (i.e. leftover seedDB demo
+// data — the "Alex Rivera" / "John Doe" / "Jane Smith" records) so it can
+// never again be matched against a real subscription. Optionally also clears
+// contactAffiliateMap and trackedSubscriptions for a given locationId so the
+// next sync rebuilds everything from scratch with clean, validated matches.
+app.post('/api/admin/purge-stale-data', (req, res) => {
+    const { locationId, resetTracking } = req.body || {};
+    const db = loadDB();
+
+    const beforeAffCount = Object.keys(db.affiliates || {}).length;
+    const removedAffiliates = [];
+    Object.entries(db.affiliates || {}).forEach(([id, a]) => {
+        if (!a.locationId) {
+            removedAffiliates.push({ id, name: a.name });
+            delete db.affiliates[id];
+        }
+    });
+
+    let removedMappings = 0;
+    let removedTracked = 0;
+
+    if (resetTracking && locationId) {
+        Object.entries(db.contactAffiliateMap || {}).forEach(([contactKey, mapping]) => {
+            if (mapping?.locationId === locationId || !mapping?.locationId) {
+                delete db.contactAffiliateMap[contactKey];
+                removedMappings++;
+            }
+        });
+        Object.entries(db.trackedSubscriptions || {}).forEach(([subId, sub]) => {
+            if (sub.locationId === locationId) {
+                delete db.trackedSubscriptions[subId];
+                removedTracked++;
+            }
+        });
+    }
+
+    saveDB(db);
+    res.json({
+        success: true,
+        removedAffiliates,
+        affiliatesBefore: beforeAffCount,
+        affiliatesAfter: Object.keys(db.affiliates || {}).length,
+        removedContactMappings: removedMappings,
+        removedTrackedSubscriptions: removedTracked
+    });
 });
 
 // ─── API: List tracked subscriptions ─────────────────────────────────────────
