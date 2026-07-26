@@ -436,6 +436,7 @@
             console.warn('autoSyncSubscriptions failed (non-fatal, will retry):', err.message);
         }
         loadWeeklyCheckStatus();
+        if (currentCampaign) refreshDashboard();
     }
 
     // ── Inline loading helpers (defensive — safe to call any time) ─────────
@@ -897,7 +898,7 @@
             const res  = await fetch(`/api/sync-subscriptions/${encodeURIComponent(locationId)}`, { method: 'POST' });
             const body = await res.json();
             if (!body.success) throw new Error(body.error || 'Sync failed');
-            let msg = `Synced ${body.rawCount} subscription(s) — ${body.added?.length || 0} new, ${body.updated?.length || 0} updated.`;
+            let msg = `Synced ${body.rawCount} subscription(s) — ${body.added?.length || 0} new, ${body.updated?.length || 0} updated, ${body.customFieldUpdates?.length || 0} affiliate contact(s) updated in CRM.`;
             if (body.fetchErrors?.length) {
                 msg += ` ⚠ Some sources failed and were skipped: ${body.fetchErrors.join('; ')}`;
             }
@@ -905,8 +906,9 @@
             btn.textContent = '✓ Synced';
             btn.classList.replace('bg-blue-600', 'bg-green-600');
             btn.classList.replace('hover:bg-blue-700', 'hover:bg-green-700');
-            // Refresh the table
+            // Refresh the tracking table AND the main dashboard (affiliates/transactions/cards)
             await loadWeeklyCheckStatus();
+            if (currentCampaign) await refreshDashboard();
             setTimeout(() => {
                 btn.textContent = 'Sync Subscriptions from GHL';
                 btn.classList.replace('bg-green-600', 'bg-blue-600');
