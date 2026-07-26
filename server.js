@@ -224,6 +224,14 @@ async function getLocationToken(companyToken, companyId, locationId) {
 const MAX_429_RETRIES     = 3;
 const RATE_LIMIT_DELAY_MS = 2000;
 
+// A failed subscription renewal check (network error, GHL 5xx, timeout, etc.)
+// must not silently cost an affiliate their reward. Instead of giving up (or
+// retrying every single hourly cron tick forever), a failed check gets
+// rescheduled exactly 1 day later, for up to MAX_CHECK_RETRIES retries —
+// see the catch block in runSubscriptionChecks.
+const MAX_CHECK_RETRIES     = 2;
+const CHECK_RETRY_DELAY_MS  = 24 * 60 * 60 * 1000; // 1 day
+
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -276,15 +284,21 @@ async function ghlApiRequest(locationId, buildConfig, { retries429 = 0 } = {}) {
     }
 }
 
-// ─── GHL: Affiliate Manager — Campaigns ──────────────────────────────────────
+// ─── GHL: Affiliate Manager — Campaigns (fully paginated, cursor-based) ──────
 async function fetchGHLCampaigns(locationId) {
-    const res = await ghlApiRequest(locationId, (token) => ({
-        method:  'get',
-        url:     `${GHL_API_BASE}/affiliate-manager/${locationId}/campaigns`,
-        headers: ghlHeaders(token, GHL_API_VER_V3),
-        timeout: 10000
-    }));
-    return (res.data.campaigns || []).map(c => ({
+    const allCampaigns = await fetchAllPagesCursor(
+        (cursor, limit) => ghlApiRequest(locationId, (token) => ({
+            method:  'get',
+            url:     `${GHL_API_BASE}/affiliate-manager/${locationId}/campaigns`,
+            params:  { limit, ...(cursor || {}) },
+            headers: ghlHeaders(token, GHL_API_VER_V3),
+            timeout: 10000
+        })),
+        (res) => res.data.campaigns
+    );
+
+    console.log(`[campaigns] fetched ${allCampaigns.length} campaign(s) for ${locationId}`);
+    return allCampaigns.map(c => ({
         id:           c._id || c.id,
         name:         c.name || '(Unnamed Campaign)',
         status:       c.deleted ? 'deleted' : (c.liveMode ? 'active' : 'draft'),
@@ -708,6 +722,7 @@ async function syncSubscriptionsFromGHL(locationId) {
 
     const contactMap = { ...db.contactAffiliateMap };
     const results = { locationId, added: [], updated: [], skipped: [], errors: [], fetchErrors, rawCount: ghlSubs.length };
+    const affiliatesToPush = new Set();
 
     // ── Single clean loop — no duplicated/orphaned code ─────────────────────
     for (const sub of ghlSubs) {
@@ -732,6 +747,7 @@ async function syncSubscriptionsFromGHL(locationId) {
             // (only cache real, scoped matches — never cache a "no match")
             if (affiliateRec && contactId) {
                 contactMap[contactId] = { affiliateId: affiliateRec.id, affiliateName: affiliateRec.name, locationId };
+                affiliatesToPush.add(affiliateRec.id);
             }
 
             // Force-generate the initial purchase transaction if it doesn't exist yet
@@ -818,6 +834,18 @@ async function syncSubscriptionsFromGHL(locationId) {
         results.errors.push({ ghlSubId: null, error: `Failed to persist database: ${saveErr.message}` });
     }
 
+    // Push fresh leads/cash-this-week/total-earned stats to CRM for every
+    // affiliate touched by this sync — once each, not once per subscription.
+    results.crmPushed = [];
+    for (const affId of affiliatesToPush) {
+        const push = await pushAffiliateStatsToCRM(db, locationId, affId);
+        if (push.success) {
+            results.crmPushed.push({ affiliateId: affId, contactId: push.contactId });
+        } else {
+            results.errors.push({ ghlSubId: null, error: `CRM push failed for affiliate ${affId}: ${push.error}` });
+        }
+    }
+
     console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${results.errors.length} errors, ${fetchErrors.length} fetch failures, ${ghlSubs.length} total`);
     return results;
 }
@@ -876,6 +904,8 @@ async function runSubscriptionChecks(locationIdFilter) {
                 rec.stopped    = true;
                 rec.lastChecked = runAt;
                 rec.checkCount  = (rec.checkCount || 0) + 1;
+                rec.checkRetryCount = 0;
+                rec.lastCheckError  = null;
                 result.action   = `stopped — status: ${liveStatus}`;
                 console.log(`[sub-check] ${tracked.contactEmail} (${tracked.billingInterval}) → STOPPED (${liveStatus})`);
 
@@ -892,6 +922,8 @@ async function runSubscriptionChecks(locationIdFilter) {
                 rec.nextCheckDate  = newNextCheck;
                 rec.lastChecked    = runAt;
                 rec.checkCount     = (rec.checkCount || 0) + 1;
+                rec.checkRetryCount = 0;
+                rec.lastCheckError  = null;
                 result.action      = `renewed — next check: ${newNextCheck}`;
                 console.log(`[sub-check] ${tracked.contactEmail} (${tracked.billingInterval}) → RENEWED, next check: ${newNextCheck}`);
 
@@ -932,64 +964,18 @@ async function runSubscriptionChecks(locationIdFilter) {
                 }
 
                 // ── Push updated stats to CRM contact custom fields ─────────
-                const locationId     = tracked.locationId;
-                const customFieldIds = db.customFields?.[locationId] || {};
-                const affiliateRec   = Object.values(db.affiliates || {}).find(a => a.id === tracked.affiliateId);
+                const locationId   = tracked.locationId;
+                const affiliateRec = Object.values(db.affiliates || {}).find(a => a.id === tracked.affiliateId);
 
-                if (affiliateRec && (customFieldIds.leads_this_week || customFieldIds.total_earned || customFieldIds.cash_this_week)) {
-                    try {
-                        // Count active affiliated subscriptions as "leads" for this affiliate
-                        const leadsCount = Object.values(db.trackedSubscriptions).filter(s =>
-                            s.affiliateId === tracked.affiliateId && s.isActive && !s.stopped
-                        ).length;
-
-                        // Cash earned in the last 7 days vs. all-time — always from
-                        // LEAF's own local ledger (never GHL's native `revenue`
-                        // figure). Reconciling from locally-generated transaction
-                        // records, not trusting GHL's own totals, is the entire
-                        // point of this system.
-                        const cashThisWeek = computeAffiliateCash(db, tracked.affiliateId, 7);
-                        const cashTotal     = computeAffiliateCash(db, tracked.affiliateId, null);
-
-                        // Prefer the affiliate's own GHL contactId when the affiliate-manager
-                        // API returned one — an email search can silently miss/mismatch when
-                        // the affiliate has no email set, or the email differs from their
-                        // contact record. But a cached contactId can go stale (contact deleted
-                        // or merged in GHL after we recorded it), so verify it still resolves
-                        // before trusting it — a 404 here falls through to the email search
-                        // instead of silently writing to a contact that no longer exists.
-                        let contactId = affiliateRec.contactId || null;
-                        if (contactId) {
-                            const verified = await getContactById(locationId, contactId);
-                            if (!verified) contactId = null;
-                        }
-                        if (!contactId && affiliateRec.email) {
-                            const contact = await searchContactByEmail(locationId, affiliateRec.email);
-                            contactId = contact?.id || contact?._id || null;
-                        }
-
-                        if (contactId) {
-                            const fields = [];
-                            if (customFieldIds.leads_this_week)
-                                fields.push({ id: customFieldIds.leads_this_week, key: 'leads_this_week', field_value: String(leadsCount) });
-                            if (customFieldIds.cash_this_week)
-                                fields.push({ id: customFieldIds.cash_this_week, key: 'cash_this_week', field_value: String(cashThisWeek) });
-                            if (customFieldIds.total_earned)
-                                fields.push({ id: customFieldIds.total_earned, key: 'total_earned', field_value: String(cashTotal) });
-                            if (fields.length) {
-                                await updateContactCustomFields(locationId, contactId, fields);
-                                result.crmUpdated = true;
-                                result.crmContactId = contactId;
-                                result.cashThisWeek = cashThisWeek;
-                                result.cashTotal = cashTotal;
-                            }
-                        } else {
-                            result.crmError = `No contact found for affiliate ${affiliateRec.name || affiliateRec.email || tracked.affiliateId}`;
-                            console.warn(`[sub-check] ${result.crmError}`);
-                        }
-                    } catch (crmErr) {
-                        result.crmError = crmErr.response?.data?.message || crmErr.message;
-                        console.warn(`[sub-check] CRM update failed for ${affiliateRec?.email}:`, result.crmError);
+                if (affiliateRec) {
+                    const push = await pushAffiliateStatsToCRM(db, locationId, tracked.affiliateId);
+                    if (push.success) {
+                        result.crmUpdated   = true;
+                        result.crmContactId = push.contactId;
+                        result.cashThisWeek = push.cashThisWeek;
+                        result.cashTotal    = push.cashTotal;
+                    } else {
+                        result.crmError = push.error;
                     }
                 }
             }
@@ -997,6 +983,38 @@ async function runSubscriptionChecks(locationIdFilter) {
         } catch (err) {
             result.error = err.response?.data?.message || err.message;
             console.error(`[sub-check] Error checking ${tracked.ghlSubId}:`, result.error);
+
+            // The GHL call itself failed (network error, 5xx, timeout, etc.) —
+            // this tells us nothing about whether the subscription actually
+            // renewed, so we must NOT mark it stopped or skip the reward.
+            // Reschedule the check 1 day out and try again, up to
+            // MAX_CHECK_RETRIES times, before falling back to the normal
+            // billing-cycle cadence — this way a transient API failure can
+            // never quietly cost the affiliate a renewal reward.
+            const rec = db.trackedSubscriptions[tracked.ghlSubId];
+            if (rec) {
+                const retryCount = (rec.checkRetryCount || 0) + 1;
+                rec.lastChecked     = runAt;
+                rec.lastCheckError  = result.error;
+
+                if (retryCount <= MAX_CHECK_RETRIES) {
+                    rec.checkRetryCount = retryCount;
+                    rec.nextCheckDate   = new Date(now + CHECK_RETRY_DELAY_MS).toISOString();
+                    result.action = `check failed — retry ${retryCount}/${MAX_CHECK_RETRIES} scheduled for ${rec.nextCheckDate}`;
+                    console.warn(`[sub-check] ${tracked.contactEmail || tracked.ghlSubId} — ${result.action}`);
+                } else {
+                    // Retries exhausted — resume the normal billing-period
+                    // cadence rather than retrying forever, but keep tracking
+                    // the subscription (don't mark it stopped) so the next
+                    // real due date still checks it and can still reward it.
+                    const intervalMs   = intervalToMs(tracked.billingInterval);
+                    const fallbackRenewal = new Date(new Date(tracked.renewalDate).getTime() + intervalMs).toISOString();
+                    rec.checkRetryCount = 0;
+                    rec.nextCheckDate   = calcNextCheckDate(fallbackRenewal);
+                    result.action = `check failed after ${MAX_CHECK_RETRIES} retries — resuming normal schedule at ${rec.nextCheckDate}`;
+                    console.error(`[sub-check] ${tracked.contactEmail || tracked.ghlSubId} — ${result.action}`);
+                }
+            }
         }
 
         summary.push(result);
@@ -1173,7 +1191,7 @@ app.post('/api/settings', (req, res) => {
     if (locationId && sheetId)
         db.settings[locationId]  = { locationId, sheetId };
     if (productId && campaignId)
-        db.products[productId]   = { id: productId, campaignId, name: productName, payoutType, payoutValue };
+        db.products[productId]   = { ...db.products[productId], id: productId, campaignId, name: productName, payoutType, payoutValue };
 
     saveDB(db);
     res.json({ success: true });
@@ -1221,6 +1239,13 @@ app.post('/webhook/purchase', (req, res) => {
 
     saveDB(db);
     res.json({ success: true, transactionId: txId });
+
+    // Push updated stats to the affiliate's CRM contact — fire-and-forget so
+    // the webhook response isn't held up by a CRM round-trip. Any failure is
+    // logged inside pushAffiliateStatsToCRM and never surfaces to the caller.
+    if (aff && aff.locationId) {
+        pushAffiliateStatsToCRM(db, aff.locationId, aff.id);
+    }
 });
 
 // ─── GHL: Locations where this app is installed (Company/Agency-level) ───────
@@ -1592,13 +1617,111 @@ async function updateContactCustomFields(locationId, contactId, fields) {
     // was previously sent as "fieldValue" (camelCase), which GHL's API
     // silently ignores instead of erroring on — so these calls were
     // returning 200 OK while never actually writing the custom field value.
-    await ghlApiRequest(locationId, (token) => ({
+    const res = await ghlApiRequest(locationId, (token) => ({
         method:  'put',
         url:     `${GHL_API_BASE}/contacts/${contactId}`,
         data:    { customFields: fields },
         headers: ghlHeaders(token, GHL_API_VER_V3),
         timeout: 10000
     }));
+
+    // Soft-verify: GHL has a track record of returning 200 OK on writes that
+    // didn't actually persist (see note above), so don't just trust the
+    // status code — check whether the updated contact object GHL sends back
+    // actually echoes each field id we just wrote. This is diagnostic only
+    // (a differently-shaped response is NOT treated as a failure, since
+    // GHL isn't guaranteed to always return the full contact), but it turns
+    // a silent no-op write into a visible warning in the logs instead of a
+    // false "success".
+    const updatedContact = res.data?.contact || res.data || {};
+    const echoedFields    = updatedContact.customFields || updatedContact.customField || null;
+    if (Array.isArray(echoedFields)) {
+        const echoedIds = new Set(echoedFields.map(f => f.id));
+        const missing   = fields.filter(f => !echoedIds.has(f.id));
+        if (missing.length) {
+            console.warn(`[crm-update] contact ${contactId}: PUT returned 200 but ${missing.length}/${fields.length} field(s) weren't echoed back in the response — id(s): ${missing.map(f => f.id).join(', ')}. The write may not have persisted.`);
+        }
+    }
+
+    return res.data;
+}
+
+// ─── CRM: Push an affiliate's stats onto their GHL contact's custom fields ──
+// Writes Leads This Week / Total Earned This Week / Total Earned (whichever
+// of the three custom fields exist for this location — see
+// setupCustomFieldsForLocation) onto the contact record for the given
+// affiliate. Called from three places so the numbers stay fresh instead of
+// only updating on the next weekly/monthly renewal check:
+//   1. syncSubscriptionsFromGHL  — right after a sync picks up new/changed subs
+//   2. runSubscriptionChecks     — after each renewal
+//   3. POST /webhook/purchase    — right after a new purchase is recorded
+// Best-effort by design: returns { success:false, error } on any failure
+// (no contact found, CRM call failed, fields not set up) rather than
+// throwing, since a CRM write failing must never abort the sync/check/webhook
+// that triggered it.
+async function pushAffiliateStatsToCRM(db, locationId, affiliateId) {
+    const customFieldIds = db.customFields?.[locationId] || {};
+    const affiliateRec   = Object.values(db.affiliates || {}).find(a => a.id === affiliateId);
+
+    if (!affiliateRec) return { success: false, error: 'affiliate not found' };
+    if (!customFieldIds.leads_this_week && !customFieldIds.cash_this_week && !customFieldIds.total_earned) {
+        return { success: false, error: 'custom fields not set up for this location' };
+    }
+
+    try {
+        // "Leads This Week" = count of this affiliate's currently active,
+        // affiliated subscriptions (i.e. live referrals still paying).
+        const leadsCount = Object.values(db.trackedSubscriptions || {}).filter(s =>
+            s.affiliateId === affiliateId && s.isActive && !s.stopped
+        ).length;
+
+        // Cash earned in the last 7 days vs. all-time — always from LEAF's own
+        // local ledger (never GHL's native `revenue` figure); reconciling from
+        // locally-generated transaction records is the whole point of this system.
+        const cashThisWeek = computeAffiliateCash(db, affiliateId, 7);
+        const cashTotal     = computeAffiliateCash(db, affiliateId, null);
+
+        // Prefer the affiliate's own GHL contactId when the affiliate-manager
+        // API returned one — an email search can silently miss/mismatch when
+        // the affiliate has no email set, or the email differs from their
+        // contact record. But a cached contactId can go stale (contact deleted
+        // or merged in GHL after we recorded it), so verify it still resolves
+        // before trusting it — a 404 falls through to the email search instead
+        // of silently writing to a contact that no longer exists.
+        let contactId = affiliateRec.contactId || null;
+        if (contactId) {
+            const verified = await getContactById(locationId, contactId);
+            if (!verified) contactId = null;
+        }
+        if (!contactId && affiliateRec.email) {
+            const contact = await searchContactByEmail(locationId, affiliateRec.email);
+            contactId = contact?.id || contact?._id || null;
+        }
+
+        if (!contactId) {
+            const error = `No contact found for affiliate ${affiliateRec.name || affiliateRec.email || affiliateId}`;
+            console.warn(`[crm-push] ${error}`);
+            return { success: false, error };
+        }
+
+        const fields = [];
+        if (customFieldIds.leads_this_week)
+            fields.push({ id: customFieldIds.leads_this_week, key: 'leads_this_week', field_value: String(leadsCount) });
+        if (customFieldIds.cash_this_week)
+            fields.push({ id: customFieldIds.cash_this_week, key: 'cash_this_week', field_value: String(cashThisWeek) });
+        if (customFieldIds.total_earned)
+            fields.push({ id: customFieldIds.total_earned, key: 'total_earned', field_value: String(cashTotal) });
+
+        if (!fields.length) return { success: false, error: 'no custom field ids configured' };
+
+        await updateContactCustomFields(locationId, contactId, fields);
+        console.log(`[crm-push] ${affiliateRec.name || affiliateRec.email}: leads=${leadsCount} cashThisWeek=${cashThisWeek} totalEarned=${cashTotal} → contact ${contactId}`);
+        return { success: true, contactId, leadsCount, cashThisWeek, cashTotal };
+    } catch (err) {
+        const error = err.response?.data?.message || err.message;
+        console.warn(`[crm-push] failed for affiliate ${affiliateRec?.email || affiliateId}:`, error);
+        return { success: false, error };
+    }
 }
 
 // ─── CRM: Create a custom field for a location ───────────────────────────────
@@ -1614,18 +1737,65 @@ async function createCustomField(locationId, name, fieldKey, dataType = 'NUMERIC
     return res.data?.customField || res.data;
 }
 
+// ─── CRM: List all custom fields for a location ──────────────────────────────
+// Endpoint: GET /locations/:locationId/customFields  Version: v3
+// Used to resolve a field's real ID when it already exists in GHL (created
+// manually in the UI, or by an earlier setup run) — without this, the
+// "already exists" case below could only ever be noted, never resolved to
+// an actual field ID, leaving db.customFields empty for that key and every
+// future CRM push silently skipping it forever.
+async function fetchLocationCustomFields(locationId) {
+    const res = await ghlApiRequest(locationId, (token) => ({
+        method:  'get',
+        url:     `${GHL_API_BASE}/locations/${locationId}/customFields`,
+        params:  { model: 'contact' },
+        headers: ghlHeaders(token, GHL_API_VER_V3),
+        timeout: 10000
+    }));
+    return res.data?.customFields || res.data?.customField || [];
+}
+
 // ─── CRM: Ensure custom fields exist for a location ──────────────────────────
 async function setupCustomFieldsForLocation(locationId) {
     const db = loadDB();
     if (!db.customFields) db.customFields = {};
     const existing = db.customFields[locationId] || {};
-    const results  = { locationId, created: [], alreadyExists: [] };
+    const results  = { locationId, created: [], resolved: [], alreadyExists: [] };
+
+    // Fetch what's actually in GHL up front. This lets a field that already
+    // exists there (created manually, or by a previous run that failed
+    // partway through before saving) get its real ID adopted immediately,
+    // instead of only being detected as "exists" via a 422 with no way to
+    // learn its ID.
+    let remoteFields = [];
+    try {
+        remoteFields = await fetchLocationCustomFields(locationId);
+    } catch (err) {
+        console.warn(`[setup-custom-fields] could not list existing fields for ${locationId}:`, err.response?.data?.message || err.message);
+    }
+    const findRemoteByName = (label) => remoteFields.find(f =>
+        (f.name || '').trim().toLowerCase() === label.trim().toLowerCase()
+    );
 
     async function ensureField(label, key) {
         if (existing[key]) {
             results.alreadyExists.push(label);
             return existing[key];
         }
+
+        // Already there in GHL — adopt its real ID rather than creating a
+        // duplicate or leaving it unresolved.
+        const remoteMatch = findRemoteByName(label);
+        if (remoteMatch) {
+            const id = remoteMatch.id || remoteMatch._id;
+            if (id) {
+                db.customFields[locationId] = { ...db.customFields[locationId], [key]: id };
+                saveDB(db);
+                results.resolved.push(label);
+                return id;
+            }
+        }
+
         try {
             const field = await createCustomField(locationId, label, key, 'NUMERICAL');
             const id = field?.id || field?._id || field?.fieldId;
@@ -1642,7 +1812,24 @@ async function setupCustomFieldsForLocation(locationId) {
             const errData = err.response?.data;
             const errMsg  = JSON.stringify(errData || err.message);
             if (err.response?.status === 422 && errMsg.toLowerCase().includes('exist')) {
-                results.alreadyExists.push(label);
+                // GHL says it exists but it wasn't in the list fetched a
+                // moment ago (race, or list pagination) — refetch once and
+                // resolve the real ID instead of leaving this field unset.
+                try {
+                    const refreshed = await fetchLocationCustomFields(locationId);
+                    const match = refreshed.find(f => (f.name || '').trim().toLowerCase() === label.trim().toLowerCase());
+                    const id = match?.id || match?._id;
+                    if (id) {
+                        db.customFields[locationId] = { ...db.customFields[locationId], [key]: id };
+                        saveDB(db);
+                        results.resolved.push(label);
+                        return id;
+                    }
+                } catch (refetchErr) {
+                    console.warn(`[setup-custom-fields] refetch after "already exists" failed for "${label}":`, refetchErr.message);
+                }
+                console.warn(`[setup-custom-fields] "${label}" already exists in GHL but its ID could not be resolved — CRM pushes will skip this field until setup is re-run successfully.`);
+                results.alreadyExists.push(`${label} (id unresolved)`);
                 return null;
             }
             console.error(`[setup-custom-fields] failed to create "${label}":`, errMsg);
@@ -1863,6 +2050,8 @@ app.get('/api/subscription-check/status', (req, res) => {
             nextCheckDate:  s.nextCheckDate,
             lastChecked:    s.lastChecked,
             checkCount:     s.checkCount || 0,
+            checkRetryCount: s.checkRetryCount || 0,
+            lastCheckError: s.lastCheckError || null,
             amount:         s.amount,
             currency:       s.currency
         }));
@@ -1888,22 +2077,38 @@ app.get('/api/weekly-check/status', (req, res) => {
     res.redirect('/api/subscription-check/status');
 });
 
-// ─── Hourly cron: auto-refresh (full sync) + check due subscription renewals ──
-cron.schedule('0 * * * *', async () => {
-    console.log('[cron] Hourly auto-refresh — syncing campaigns/products/affiliates/subscriptions for all locations');
+// ─── Sync runner shared by the boot-time kickoff and the hourly cron tick ────
+async function runFullSyncCycle(trigger) {
+    console.log(`[${trigger}] Auto-refresh — syncing campaigns/products/affiliates/subscriptions for all locations`);
     try {
         await autoRefreshAllLocations();
     } catch (err) {
-        console.error('[cron] Auto-refresh failed:', err.message);
+        console.error(`[${trigger}] Auto-refresh failed:`, err.message);
     }
 
-    console.log('[cron] Hourly subscription renewal check');
+    console.log(`[${trigger}] Subscription renewal check`);
     try {
         await runSubscriptionChecks(null);
     } catch (err) {
-        console.error('[cron] Subscription check failed:', err.message);
+        console.error(`[${trigger}] Subscription check failed:`, err.message);
     }
-}, { timezone: 'UTC' });
+}
+
+// ─── Hourly cron: auto-refresh (full sync) + check due subscription renewals ──
+cron.schedule('0 * * * *', () => runFullSyncCycle('cron'), { timezone: 'UTC' });
+
+// ─── Boot-time sync: run once on startup so a fresh deploy/restart doesn't ───
+// sit on stale data for up to 59 minutes waiting for the next hourly tick.
+// Fired after the server starts listening (see app.listen below) rather than
+// here, so it runs against a fully-initialized process.
+let bootSyncStarted = false;
+function runBootSyncOnce() {
+    if (bootSyncStarted) return;
+    bootSyncStarted = true;
+    runFullSyncCycle('boot-sync').catch(err => {
+        console.error('[boot-sync] unexpected failure:', err.message);
+    });
+}
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
@@ -1921,4 +2126,7 @@ const PORT = process.env.PORT || 5000;
 if (!process.env.GHL_APP_ID) {
     console.warn('[startup] WARNING: GHL_APP_ID is not set. Company/Agency-level OAuth installs will resolve 0 locations until this is configured (GET /oauth/installedLocations requires it).');
 }
-app.listen(PORT, '0.0.0.0', () => console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'}`));
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'}`);
+    runBootSyncOnce();
+});
