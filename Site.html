@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LEAF | Affiliate Intelligence for CRM</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .page { display: none; }
+        .page.active { display: block; }
+        .nav-link.active { color: #2563eb; font-weight: 600; border-bottom: 2px solid #2563eb; }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+
+    <nav class="bg-white border-b border-gray-200 sticky top-0 z-50">
+        <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+            <div class="flex items-center gap-2 cursor-pointer" onclick="showPage('home')">
+                <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xl">L</div>
+                <span class="font-bold text-lg tracking-tight">LEAF</span>
+            </div>
+            <div class="flex items-center gap-6 text-sm font-medium text-gray-600">
+                <span class="cursor-pointer nav-link active" id="link-home" onclick="showPage('home')">Home</span>
+                <span class="cursor-pointer nav-link" id="link-support" onclick="showPage('support')">Support</span>
+                <span class="cursor-pointer nav-link" id="link-privacy" onclick="showPage('privacy')">Privacy</span>
+                <span class="cursor-pointer nav-link" id="link-terms" onclick="showPage('terms')">Terms</span>
+                <a href="#" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded-lg transition-colors">Install App</a>
+            </div>
+        </div>
+    </nav>
+
+    <main id="content" class="min-h-screen">
+        
+        <section id="page-home" class="page active">
+            <!-- 1. Hero -->
+            <div class="bg-white py-20 border-b border-gray-100">
+                <div class="max-w-4xl mx-auto px-6 text-center space-y-6">
+                    <h1 class="text-6xl font-extrabold tracking-tight text-gray-900 leading-tight">
+                        Affiliate Intelligence<br><span class="text-blue-600">for your CRM</span>
+                    </h1>
+                    <p class="text-xl text-gray-600 max-w-2xl mx-auto">
+                        Enterprise-grade payout rules, automated subscription renewal tracking, and precise financial reconciliation designed for your CRM.
+                    </p>
+                    <div class="pt-4">
+                        <a href="#" class="bg-blue-600 text-white px-8 py-4 rounded-xl font-semibold shadow-lg shadow-blue-200 hover:bg-blue-700 transition-all">Install to your CRM</a>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 2. Features -->
+            <div class="max-w-6xl mx-auto px-6 py-20">
+                <h2 class="text-3xl font-bold text-center mb-16">Core Capabilities</h2>
+                <div class="grid md:grid-cols-3 gap-8">
+                    <div class="bg-white p-8 rounded-2xl border border-gray-100 shadow-sm">
+                        <div class="text-blue-600 mb-4 font-bold text-2xl">01</div>
+                        <h3 class="font-bold text-xl mb-3">Automated Reconciliation</h3>
+                        <p class="text-gray-500">Define per-product reward rules and let LEAF handle all financial reconciliation automatically.</p>
+                    </div>
+                    <div class="bg-white p-8 rounded-2xl border border-gray-100 shadow-sm">
+                        <div class="text-blue-600 mb-4 font-bold text-2xl">02</div>
+                        <h3 class="font-bold text-xl mb-3">Subscription Tracking</h3>
+                        <p class="text-gray-500">Automated hourly checks for renewals ensure you never miss an affiliate payout.</p>
+                    </div>
+                    <div class="bg-white p-8 rounded-2xl border border-gray-100 shadow-sm">
+                        <div class="text-blue-600 mb-4 font-bold text-2xl">03</div>
+                        <h3 class="font-bold text-xl mb-3">CRM Sync</h3>
+                        <p class="text-gray-500">Seamlessly sync data back to your contact custom fields for internal reporting.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3. The Problem -->
+            <div class="bg-gray-900 text-white py-20">
+                <div class="max-w-5xl mx-auto px-6 grid md:grid-cols-2 gap-16 items-center">
+                    <div>
+                        <h2 class="text-4xl font-bold mb-6">Stop manual tracking.</h2>
+                        <p class="text-gray-400 leading-relaxed text-lg">Manual affiliate management leads to revenue leakage and attribution errors. LEAF bridges the gap by creating a single source of truth for your commissions within the CRM ecosystem.</p>
+                    </div>
+                    <div class="bg-gray-800 rounded-3xl p-8 border border-gray-700">
+                        <pre class="text-blue-400 font-mono text-sm overflow-x-auto"><code>// LEAF Intelligence Engine
+if (subscription.renewed) {
+   calculateReward(sub);
+   updateCRM(contactId);
+}</code></pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 4. FAQ -->
+            <div class="max-w-3xl mx-auto px-6 py-20 space-y-8">
+                <h2 class="text-3xl font-bold text-center">Frequently Asked Questions</h2>
+                <div class="space-y-4">
+                    <div class="bg-white p-6 rounded-xl border border-gray-100 shadow-sm"><span class="font-bold">Q: How do I install?</span><br><p class="text-gray-600 mt-2">Simply add the application via the CRM Marketplace.</p></div>
+                    <div class="bg-white p-6 rounded-xl border border-gray-100 shadow-sm"><span class="font-bold">Q: Is my data secure?</span><br><p class="text-gray-600 mt-2">We use industry-standard encryption and OAuth for all CRM communication.</p></div>
+                </div>
+            </div>
+
+            <!-- 5. Footer -->
+            <div class="text-center py-20 border-t border-gray-200">
+                <h2 class="text-2xl font-bold mb-8">Ready to automate your affiliates?</h2>
+                <a href="#" class="bg-gray-900 text-white px-8 py-4 rounded-xl font-semibold">Connect Your CRM</a>
+            </div>
+        </section>
+
+        <section id="page-support" class="page max-w-4xl mx-auto px-6 py-12">
+            <h1 class="text-4xl font-bold mb-8">Documentation & Support</h1>
+            <div class="bg-white p-8 rounded-2xl border border-gray-100 shadow-sm space-y-8">
+                <section>
+                    <h2 class="text-2xl font-semibold mb-3">1. Getting Started</h2>
+                    <p class="text-gray-600">Install the application from the marketplace. Once authorized, our system will begin scanning for available campaigns.</p>
+                </section>
+                <section>
+                    <h2 class="text-2xl font-semibold mb-3">2. Configuring Products</h2>
+                    <p class="text-gray-600">Visit the "Products & Rules" tab. Here you map product IDs to specific payout values. Choose between 'CASH' or 'LEAD' types to define rewards.</p>
+                </section>
+                <section>
+                    <h2 class="text-2xl font-semibold mb-3">3. Syncing Subscriptions</h2>
+                    <p class="text-gray-600">Click "Sync Subscriptions" to force an immediate update. The system will create transaction records for every identified subscription.</p>
+                </section>
+                <section>
+                    <h2 class="text-2xl font-semibold mb-3">4. Troubleshooting</h2>
+                    <p class="text-gray-600">If leads are not appearing, ensure the Affiliate ID matches the mapping in our database. Contact support at <a href="mailto:support@irofficial.com" class="text-blue-600">support@irofficial.com</a>.</p>
+                </section>
+            </div>
+        </section>
+
+        <section id="page-privacy" class="page max-w-4xl mx-auto px-6 py-12">
+            <h1 class="text-4xl font-bold mb-8">Privacy Policy</h1>
+            <div class="bg-white p-8 rounded-2xl border border-gray-100 shadow-sm text-gray-600 space-y-6 leading-relaxed">
+                <p><strong>Effective Date:</strong> July 27, 2026</p>
+                <p>LEAF Affiliate Manager respects your privacy. We collect the minimum data required to fulfill our reconciliation services.</p>
+                <h3 class="text-xl font-semibold text-gray-900">Data Collection</h3>
+                <p>We access API data provided by the CRM, specifically contact information, subscription billing status, and product IDs.</p>
+                <h3 class="text-xl font-semibold text-gray-900">Data Sharing</h3>
+                <p>We do not share, sell, or disclose your data to third parties. All data is processed securely to calculate affiliate commissions.</p>
+            </div>
+        </section>
+
+        <section id="page-terms" class="page max-w-4xl mx-auto px-6 py-12">
+            <h1 class="text-4xl font-bold mb-8">Terms of Service</h1>
+            <div class="bg-white p-8 rounded-2xl border border-gray-100 shadow-sm text-gray-600 space-y-6 leading-relaxed">
+                <h3 class="text-xl font-semibold text-gray-900">1. Acceptance of Terms</h3>
+                <p>By installing LEAF, you agree to these terms.</p>
+                <h3 class="text-xl font-semibold text-gray-900">2. Software Usage</h3>
+                <p>LEAF is provided "as is". While we strive for accuracy, users remain responsible for auditing their financial data and commissions paid.</p>
+                <h3 class="text-xl font-semibold text-gray-900">3. Liability</h3>
+                <p>LEAF is not liable for indirect damages, including lost profits or incorrect payout calculations resulting from external API data errors.</p>
+            </div>
+        </section>
+
+    </main>
+
+    <script>
+        function showPage(pageId) {
+            // Hide all pages
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+            
+            // Show target
+            document.getElementById('page-' + pageId).classList.add('active');
+            document.getElementById('link-' + pageId).classList.add('active');
+            window.scrollTo(0, 0);
+        }
+    </script>
+</body>
+</html>
