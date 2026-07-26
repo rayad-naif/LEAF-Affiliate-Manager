@@ -1110,6 +1110,85 @@ app.post('/webhook/purchase', (req, res) => {
     res.json({ success: true, transactionId: txId });
 });
 
+// ─── GHL: Locations where this app is installed (Company/Agency-level) ───────
+// Requires BOTH companyId and appId per GHL's API — a missing GHL_APP_ID env
+// var is the #1 cause of this silently returning zero locations, since GHL
+// rejects the request without a valid appId. Paginated via skip/limit.
+async function fetchInstalledLocationsForCompany(companyToken, companyId) {
+    if (!process.env.GHL_APP_ID) {
+        throw new Error('GHL_APP_ID environment variable is not set — GoHighLevel requires it to look up installed locations for a company/agency install.');
+    }
+
+    const allLocs = [];
+    let skip = 0;
+    const limit = 100;
+
+    while (true) {
+        const res = await axios.get(GHL_INSTALLED_LOCS, {
+            params: {
+                companyId,
+                appId: process.env.GHL_APP_ID,
+                isInstalled: true,
+                limit, skip
+            },
+            headers: { 'Authorization': `Bearer ${companyToken}`, 'Version': GHL_API_VER, 'Accept': 'application/json' },
+            timeout: 10000
+        });
+        const page = res.data?.locations || res.data?.installedLocations || res.data?.data || [];
+        allLocs.push(...page);
+        if (page.length < limit) break;
+        skip += limit;
+    }
+
+    const locIds = allLocs.map(l => l.locationId || l._id || l.id).filter(Boolean);
+    console.log(`[oauth] installedLocations returned ${locIds.length} location(s) for company ${companyId}`);
+    return locIds;
+}
+
+// ─── API: Manually re-resolve + token-exchange locations for a company ───────
+// Use this after an install shows "0 locations" (e.g. GHL_APP_ID was missing
+// at install time and has since been fixed, or a new sub-account was added to
+// the agency afterward) — no need to fully reinstall the app.
+app.post('/api/admin/resolve-locations/:companyId', async (req, res) => {
+    const { companyId } = req.params;
+    const db = loadDB();
+    const companyInstall = db.installs[`company_${companyId}`];
+    if (!companyInstall?.accessToken) {
+        return res.status(400).json({ success: false, error: `No stored company token for ${companyId}. Reinstall the app first.` });
+    }
+
+    try {
+        let companyToken = companyInstall.accessToken;
+        if (isTokenExpired(companyInstall)) companyToken = await refreshCompanyToken(companyId);
+
+        const locIds = await fetchInstalledLocationsForCompany(companyToken, companyId);
+        const resolved = [];
+        const errors = [];
+
+        for (const locId of locIds) {
+            try {
+                const locData = await getLocationToken(companyToken, companyId, locId);
+                db.installs[locId] = {
+                    locationId: locId, accessToken: locData.accessToken,
+                    refreshToken: locData.refreshToken || companyInstall.refreshToken,
+                    tokenType: locData.tokenType || 'Bearer', expiresIn: locData.expiresIn,
+                    scope: locData.scope || companyInstall.scope, userId: locData.userId || companyInstall.userId,
+                    companyId, userType: 'Location', installedAt: db.installs[locId]?.installedAt || new Date().toISOString(),
+                    updatedAt: new Date().toISOString()
+                };
+                resolved.push(locId);
+            } catch (locErr) {
+                errors.push({ locationId: locId, error: locErr.response?.data?.message || locErr.message });
+            }
+        }
+        saveDB(db);
+        res.json({ success: true, resolvedLocations: resolved, total: locIds.length, errors });
+    } catch (err) {
+        console.error('[resolve-locations] error:', err.response?.data || err.message);
+        res.status(500).json({ success: false, error: err.response?.data?.message || err.message });
+    }
+});
+
 // ─── GHL OAuth — /oauth/callback/lc ──────────────────────────────────────────
 app.get('/oauth/callback/lc', async (req, res) => {
     const { code, error, error_description } = req.query;
@@ -1139,11 +1218,17 @@ app.get('/oauth/callback/lc', async (req, res) => {
         const {
             access_token, refresh_token, token_type, expires_in, scope,
             userType, locationId: directLocationId, companyId, userId,
+            // NOTE: GHL's /oauth/token response does NOT reliably include an
+            // approved-locations array for Company/bulk installs (confirmed
+            // gap in GHL's own API — see highlevel-api-docs#294). Location
+            // resolution for a Company install almost always has to go
+            // through the separate installedLocations call below.
             approvedLocations = []
         } = tokenRes.data;
 
         const db = loadDB();
         const installedLocations = [];
+        let locationResolveError = null;
 
         if (userType === 'Location' && directLocationId) {
             db.installs[directLocationId] = {
@@ -1164,15 +1249,9 @@ app.get('/oauth/callback/lc', async (req, res) => {
             let locIds = approvedLocations.length > 0 ? [...approvedLocations] : [];
             if (locIds.length === 0) {
                 try {
-                    const ilRes = await axios.get(GHL_INSTALLED_LOCS, {
-                        params:  { companyId, appId: process.env.GHL_APP_ID, isInstalled: true, limit: 100 },
-                        headers: { 'Authorization': `Bearer ${access_token}`, 'Version': GHL_API_VER, 'Accept': 'application/json' },
-                        timeout: 10000
-                    });
-                    const rawLocs = ilRes.data?.locations || ilRes.data?.installedLocations || [];
-                    locIds = rawLocs.map(l => l.locationId || l._id || l.id).filter(Boolean);
-                    console.log(`[oauth] installedLocations returned ${locIds.length} location(s):`, locIds);
+                    locIds = await fetchInstalledLocationsForCompany(access_token, companyId);
                 } catch (ilErr) {
+                    locationResolveError = ilErr.response?.data?.message || ilErr.message;
                     console.error('[oauth] installedLocations fetch failed:', ilErr.response?.data || ilErr.message);
                 }
             }
@@ -1192,6 +1271,12 @@ app.get('/oauth/callback/lc', async (req, res) => {
                     console.error(`[oauth] location token failed for ${locId}:`, locErr.response?.data || locErr.message);
                 }
             }
+
+            // Locations existed but every one of them failed the token exchange —
+            // still worth surfacing rather than a silent "0 locations".
+            if (!locationResolveError && locIds.length > 0 && installedLocations.length === 0) {
+                locationResolveError = `Found ${locIds.length} installed location(s) but the location-token exchange failed for all of them — check server logs for details.`;
+            }
         } else {
             console.error('[oauth] unexpected token response:', tokenRes.data);
             return res.status(400).send(`<h2>Unexpected token response from CRM</h2><pre>${JSON.stringify(tokenRes.data, null, 2)}</pre>`);
@@ -1210,6 +1295,34 @@ app.get('/oauth/callback/lc', async (req, res) => {
         saveDB(db);
 
         const primaryLocId = installedLocations[0] || '';
+        const noLocationsBlock = locationResolveError
+            ? `<div class="bg-red-50 border border-red-200 rounded-xl p-4 text-left text-sm text-red-700 mb-4">
+                 <strong>Locations couldn't be resolved:</strong> ${locationResolveError}
+                 ${!process.env.GHL_APP_ID ? '<br><br>Set the <code>GHL_APP_ID</code> environment variable (found under your app\'s settings in the GHL Marketplace) and click retry below — no need to reinstall.' : ''}
+               </div>
+               <button onclick="retryResolve()" class="inline-block bg-gray-900 hover:bg-gray-800 text-white font-semibold px-6 py-3 rounded-xl transition-colors">Retry resolving locations</button>
+               <p id="retryStatus" class="text-gray-400 text-xs mt-3"></p>
+               <script>
+                 async function retryResolve() {
+                   const statusEl = document.getElementById('retryStatus');
+                   statusEl.textContent = 'Retrying…';
+                   try {
+                     const res = await fetch('/api/admin/resolve-locations/${companyId}', { method: 'POST' });
+                     const data = await res.json();
+                     if (data.success && data.resolvedLocations.length > 0) {
+                       window.location.href = '/?locationId=' + data.resolvedLocations[0];
+                     } else if (data.success) {
+                       statusEl.textContent = 'Still 0 locations resolved. ' + (data.errors?.[0]?.error || 'Check server logs.');
+                     } else {
+                       statusEl.textContent = data.error || 'Retry failed.';
+                     }
+                   } catch (e) {
+                     statusEl.textContent = 'Retry failed: ' + e.message;
+                   }
+                 }
+               </script>`
+            : `<p class="text-gray-400 text-sm">No locations resolved.</p>`;
+
         return res.send(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>LEAF Installed</title><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="bg-gray-50 flex items-center justify-center min-h-screen font-sans">
@@ -1229,7 +1342,7 @@ app.get('/oauth/callback/lc', async (req, res) => {
       <div class="flex justify-between"><span class="text-gray-500">Locations</span><span class="font-bold text-blue-600">${installedLocations.length}</span></div>
       <div class="flex justify-between"><span class="text-gray-500">Campaigns cached</span><span class="font-bold text-green-600">${totalCampaigns}</span></div>
     </div>
-    ${primaryLocId ? `<a href="/?locationId=${primaryLocId}" class="inline-block bg-blue-600 hover:bg-blue-700 text-white font-semibold px-6 py-3 rounded-xl transition-colors">Open Dashboard →</a>` : `<p class="text-gray-400 text-sm">No locations resolved.</p>`}
+    ${primaryLocId ? `<a href="/?locationId=${primaryLocId}" class="inline-block bg-blue-600 hover:bg-blue-700 text-white font-semibold px-6 py-3 rounded-xl transition-colors">Open Dashboard →</a>` : noLocationsBlock}
   </div>
 </body></html>`);
 
@@ -1640,9 +1753,14 @@ app.get('/health', (req, res) => {
         status:  'ok',
         version: 'CRM API v2 | Subscription Tracker v3 (auto-refresh + recurring rewards)',
         time:    new Date().toISOString(),
-        callbackUrl: process.env.GHL_REDIRECT_URI || '(redirect URI not set)'
+        callbackUrl: process.env.GHL_REDIRECT_URI || '(redirect URI not set)',
+        ghlAppIdConfigured: !!process.env.GHL_APP_ID,
+        warning: process.env.GHL_APP_ID ? undefined : 'GHL_APP_ID is not set — Company/Agency-level installs will resolve 0 locations. Set it and use POST /api/admin/resolve-locations/:companyId to fix existing installs.'
     });
 });
 
 const PORT = process.env.PORT || 5000;
+if (!process.env.GHL_APP_ID) {
+    console.warn('[startup] WARNING: GHL_APP_ID is not set. Company/Agency-level OAuth installs will resolve 0 locations until this is configured (GET /oauth/installedLocations requires it).');
+}
 app.listen(PORT, '0.0.0.0', () => console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'}`));
