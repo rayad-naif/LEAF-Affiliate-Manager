@@ -484,6 +484,31 @@ async function syncSubscriptionsFromGHL(locationId) {
 
         const existing = db.trackedSubscriptions[ghlSubId];
 
+        // NEW: Grab the Product ID from the subscription and apply custom rules!
+        const productId = sub.recurringProduct?.product?._id || sub.productId;
+        
+        if (!existing && affiliateEntry && productId) {
+            const rule = db.products[productId];
+            // If a rule exists and has a value, generate the initial transaction
+            if (rule && rule.payoutValue > 0) {
+                const txId = `tx_sync_${ghlSubId}`;
+                db.transactions[txId] = {
+                    id: txId, 
+                    campaignId: rule.campaignId || affiliateEntry.campaignId || 'unknown',
+                    contactId: contactId,
+                    affiliateName: affiliateEntry.affiliateName,
+                    productId: productId,
+                    subscriptionId: ghlSubId,
+                    type: rule.payoutType || 'CASH', // This applies 'LEAD' if configured!
+                    amount: rule.payoutValue,
+                    createdAt: sub.createdAt || new Date().toISOString()
+                };
+            }
+        }
+
+        // Always store the subscription (affiliated or not) so admin can see raw data.
+        // Only active-status check is gated on affiliate association.
+
         // Always store the subscription (affiliated or not) so admin can see raw data.
         // Only active-status check is gated on affiliate association.
         const record = {
@@ -726,12 +751,24 @@ app.get('/api/dashboard/:campaignId', async (req, res) => {
         (!p.campaignId && p.locationId === (campaign?.locationId || locationId))
     );
 
-    const transactions = Object.values(db.transactions)
-        .filter(t => t.campaignId === campaignId)
+    const allCampaignTxns = Object.values(db.transactions)
+        .filter(t => t.campaignId === campaignId);
+
+    // OVERRIDE native GHL stats with your custom Product Rules
+    affiliates.forEach(aff => {
+        const affTxns = allCampaignTxns.filter(t => t.affiliateName?.toLowerCase() === aff.name?.toLowerCase());
+        
+        // Sum up CASH rules and LEAD rules separately
+        aff.totalCash  = affTxns.filter(t => t.type === 'CASH').reduce((sum, t) => sum + Number(t.amount || 0), 0);
+        aff.totalLeads = affTxns.filter(t => t.type === 'LEAD').reduce((sum, t) => sum + Number(t.amount || 0), 0);
+        aff.customer   = affTxns.length; // Total transaction count
+    });
+
+    const recentTransactions = allCampaignTxns
         .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
         .slice(0, 50);
 
-    res.json({ success: true, affiliates, transactions, products, campaign: campaign || null });
+    res.json({ success: true, affiliates, transactions: recentTransactions, products, campaign: campaign || null });
 });
 
 // ─── API: Save settings / product rules ──────────────────────────────────────
