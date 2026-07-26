@@ -294,6 +294,44 @@ async function fetchGHLCampaigns(locationId) {
     }));
 }
 
+// ─── Cursor-based pagination for GHL v3 endpoints ────────────────────────────
+// IMPORTANT: the v3 endpoints (affiliate-manager, payments/subscriptions,
+// payments/transactions) validate query params strictly and REJECT an
+// `offset` param outright with a 422 ("property offset should not exist") —
+// unlike the older v1-style endpoints (e.g. Products, 2021-07-28) which do
+// accept classic offset/limit. v3 instead paginates with a cursor: each
+// response carries `meta.startAfter` / `meta.startAfterId` pointing at the
+// next page. If a given payload doesn't include that meta block, we derive
+// the same cursor from the last item of the page we just received (its own
+// id + createdAt/dateAdded timestamp) — GHL accepts either.
+//
+// `requestPage(cursor, limit)` must return the raw axios response for one
+// page, given the current cursor (`null` for the first page) and the page
+// size. `getItems(res)` extracts that page's array of items from the
+// response.
+async function fetchAllPagesCursor(requestPage, getItems, limit = 100) {
+    const all = [];
+    let cursor = null;
+
+    while (true) {
+        const res  = await requestPage(cursor, limit);
+        const page = getItems(res) || [];
+        all.push(...page);
+
+        if (page.length < limit) break; // last page
+
+        const meta = res.data?.meta || {};
+        const last = page[page.length - 1] || {};
+        const startAfterId = meta.startAfterId || last._id || last.id;
+        const startAfter    = meta.startAfter   || last.createdAt || last.dateAdded;
+
+        if (!startAfterId) break; // no cursor to advance with — stop rather than loop forever
+        cursor = { startAfter, startAfterId };
+    }
+
+    return all;
+}
+
 // ─── GHL: Products (fully paginated — fetches every page, not just the first) ─
 async function fetchGHLProducts(locationId) {
     const db = loadDB();
@@ -329,25 +367,18 @@ async function fetchGHLProducts(locationId) {
     });
 }
 
-// ─── GHL: Affiliate Manager — Affiliates (fully paginated) ───────────────────
+// ─── GHL: Affiliate Manager — Affiliates (fully paginated, cursor-based) ─────
 async function fetchGHLAffiliates(locationId) {
-    const allAffiliates = [];
-    let offset = 0;
-    const limit = 100;
-
-    while (true) {
-        const res = await ghlApiRequest(locationId, (token) => ({
+    const allAffiliates = await fetchAllPagesCursor(
+        (cursor, limit) => ghlApiRequest(locationId, (token) => ({
             method:  'get',
             url:     `${GHL_API_BASE}/affiliate-manager/${locationId}/affiliates`,
-            params:  { limit, offset },
+            params:  { limit, ...(cursor || {}) },
             headers: ghlHeaders(token, GHL_API_VER_V3),
             timeout: 10000
-        }));
-        const page = res.data.affiliates || [];
-        allAffiliates.push(...page);
-        if (page.length < limit) break;
-        offset += limit;
-    }
+        })),
+        (res) => res.data.affiliates
+    );
 
     console.log(`[affiliates] fetched ${allAffiliates.length} affiliate(s) for ${locationId}`);
     return allAffiliates.map(a => ({
@@ -392,23 +423,16 @@ function associateAffiliatesWithCampaigns(affiliates, campaigns) {
 // ─── GHL: Payments — List Subscriptions ──────────────────────────────────────
 // GET /payments/subscriptions?altId=locationId&altType=location  Version: v3
 async function fetchGHLSubscriptions(locationId) {
-    const allSubs = [];
-    let offset = 0;
-    const limit = 100;
-
-    while (true) {
-        const res = await ghlApiRequest(locationId, (token) => ({
+    const allSubs = await fetchAllPagesCursor(
+        (cursor, limit) => ghlApiRequest(locationId, (token) => ({
             method:  'get',
             url:     `${GHL_API_BASE}/payments/subscriptions`,
-            params:  { altId: locationId, altType: 'location', limit, offset },
+            params:  { altId: locationId, altType: 'location', limit, ...(cursor || {}) },
             headers: ghlHeaders(token, GHL_API_VER_V3),
             timeout: 15000
-        }));
-        const page = res.data?.data || [];
-        allSubs.push(...page);
-        if (page.length < limit) break;
-        offset += limit;
-    }
+        })),
+        (res) => res.data?.data
+    );
 
     console.log(`[subscriptions] fetched ${allSubs.length} subscription(s) for ${locationId}`);
     return allSubs;
@@ -429,23 +453,16 @@ async function fetchGHLSubscriptionById(locationId, ghlSubId) {
 // ─── GHL: Payments — List Transactions ───────────────────────────────────────
 // GET /payments/transactions?altId=locationId&altType=location  Version: v3
 async function fetchGHLTransactions(locationId) {
-    const allTxns = [];
-    let offset = 0;
-    const limit = 100;
-
-    while (true) {
-        const res = await ghlApiRequest(locationId, (token) => ({
+    const allTxns = await fetchAllPagesCursor(
+        (cursor, limit) => ghlApiRequest(locationId, (token) => ({
             method:  'get',
             url:     `${GHL_API_BASE}/payments/transactions`,
-            params:  { altId: locationId, altType: 'location', limit, offset },
+            params:  { altId: locationId, altType: 'location', limit, ...(cursor || {}) },
             headers: ghlHeaders(token, GHL_API_VER_V3),
             timeout: 15000
-        }));
-        const page = res.data?.data || [];
-        allTxns.push(...page);
-        if (page.length < limit) break;
-        offset += limit;
-    }
+        })),
+        (res) => res.data?.data
+    );
 
     console.log(`[transactions] fetched ${allTxns.length} transaction(s) for ${locationId}`);
     return allTxns;
@@ -618,13 +635,30 @@ async function syncSubscriptionsFromGHL(locationId) {
     // Fetch everything we need in parallel — subscriptions, transactions,
     // ALL affiliates (paginated), ALL products (paginated), and campaigns
     // (so affiliates/products can be associated to the right campaign below).
-    const [ghlSubs, ghlTxns, ghlAffiliates, ghlProducts, ghlCampaigns] = await Promise.all([
+    //
+    // Promise.allSettled, not Promise.all: if e.g. the subscriptions call
+    // fails, we still want whatever affiliates/products/campaigns DID come
+    // back to be used and persisted, rather than the whole sync throwing
+    // away every source just because one of them errored.
+    const settled = await Promise.allSettled([
         fetchGHLSubscriptions(locationId),
         fetchGHLTransactions(locationId),
         fetchGHLAffiliates(locationId),
         fetchGHLProducts(locationId),
         fetchGHLCampaigns(locationId)
     ]);
+    const fetchLabels = ['subscriptions', 'transactions', 'affiliates', 'products', 'campaigns'];
+    const fetchErrors = [];
+    settled.forEach((r, i) => {
+        if (r.status === 'rejected') {
+            const err = r.reason;
+            const msg = err.response?.data?.message || err.message;
+            console.error(`[sync-subs] ${fetchLabels[i]} fetch failed for ${locationId}:`, msg);
+            fetchErrors.push(`${fetchLabels[i]}: ${msg}`);
+        }
+    });
+    const [ghlSubs, ghlTxns, ghlAffiliates, ghlProducts, ghlCampaigns] =
+        settled.map(r => (r.status === 'fulfilled' ? r.value : []));
 
     // Associate affiliates with the campaigns that list them, THEN merge into
     // the local store so IDs/refIds/campaignIds are current.
@@ -649,7 +683,7 @@ async function syncSubscriptionsFromGHL(locationId) {
     });
 
     const contactMap = { ...db.contactAffiliateMap };
-    const results = { locationId, added: [], updated: [], skipped: [], errors: [], rawCount: ghlSubs.length };
+    const results = { locationId, added: [], updated: [], skipped: [], errors: [], fetchErrors, rawCount: ghlSubs.length };
 
     // ── Single clean loop — no duplicated/orphaned code ─────────────────────
     for (const sub of ghlSubs) {
@@ -760,7 +794,7 @@ async function syncSubscriptionsFromGHL(locationId) {
         results.errors.push({ ghlSubId: null, error: `Failed to persist database: ${saveErr.message}` });
     }
 
-    console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${results.errors.length} errors, ${ghlSubs.length} total`);
+    console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${results.errors.length} errors, ${fetchErrors.length} fetch failures, ${ghlSubs.length} total`);
     return results;
 }
 
@@ -960,27 +994,50 @@ app.get('/api/campaigns/:locationId', async (req, res) => {
         return res.json({ success: true, campaigns, source: 'local' });
     }
 
-    try {
-        const [campaigns, affiliates, products] = await Promise.all([
-            fetchGHLCampaigns(locationId),
-            fetchGHLAffiliates(locationId),
-            fetchGHLProducts(locationId)
-        ]);
+    // Promise.allSettled, not Promise.all: previously, one failing fetch (e.g.
+    // affiliates hitting a 422) rejected the whole Promise.all and threw away
+    // campaigns/products data that fetched just fine — silently dumping the
+    // whole dashboard into 'local' fallback. Now each source is handled
+    // independently and we only fall back per-source, with the real error
+    // surfaced instead of swallowed.
+    const settled = await Promise.allSettled([
+        fetchGHLCampaigns(locationId),
+        fetchGHLAffiliates(locationId),
+        fetchGHLProducts(locationId)
+    ]);
+    const labels = ['campaigns', 'affiliates', 'products'];
+    const errors = [];
+    settled.forEach((r, i) => {
+        if (r.status === 'rejected') {
+            const err = r.reason;
+            const msg = err.response?.data?.message || err.message;
+            console.error(`[campaigns] ${labels[i]} fetch failed for ${locationId}:`, msg);
+            errors.push(`${labels[i]}: ${msg}`);
+        }
+    });
 
+    const localCampaigns = Object.values(db.campaigns).filter(c => c.locationId === locationId);
+    const campaigns  = settled[0].status === 'fulfilled' ? settled[0].value : localCampaigns;
+    const affiliates = settled[1].status === 'fulfilled' ? settled[1].value : [];
+    const products    = settled[2].status === 'fulfilled' ? settled[2].value  : [];
+
+    if (settled[0].status === 'fulfilled' || settled[1].status === 'fulfilled') {
         associateAffiliatesWithCampaigns(affiliates, campaigns);
-
-        campaigns.forEach(c  => { db.campaigns[c.id]  = c; });
-        affiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a }; });
-        products.forEach(p   => { db.products[p.id]   = p; });
-        saveDB(db);
-
-        console.log(`[campaigns] synced for ${locationId}: ${campaigns.length} campaigns, ${affiliates.length} affiliates, ${products.length} products`);
-        return res.json({ success: true, campaigns, source: 'crm' });
-    } catch (err) {
-        console.error('[campaigns] GHL fetch failed:', err.response?.data || err.message);
-        const campaigns = Object.values(db.campaigns).filter(c => c.locationId === locationId);
-        return res.json({ success: true, campaigns, source: 'local', warning: err.message });
     }
+    campaigns.forEach(c  => { db.campaigns[c.id]  = c; });
+    affiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a }; });
+    products.forEach(p   => { db.products[p.id]   = p; });
+    saveDB(db);
+
+    const allFailed = errors.length === settled.length;
+    const source = allFailed ? 'local' : (errors.length ? 'crm-partial' : 'crm');
+    console.log(`[campaigns] synced for ${locationId}: ${campaigns.length} campaigns, ${affiliates.length} affiliates, ${products.length} products` + (errors.length ? ` (${errors.length} source(s) failed)` : ''));
+    return res.json({
+        success: true,
+        campaigns: allFailed ? localCampaigns : campaigns,
+        source,
+        warning: errors.length ? errors.join('; ') : undefined
+    });
 });
 
 // ─── API: Dashboard data for a campaign ──────────────────────────────────────
@@ -989,20 +1046,35 @@ app.get('/api/dashboard/:campaignId', async (req, res) => {
     const { locationId } = req.query;
     const db = loadDB();
 
-    // Best-effort live sync — dashboard still renders from local data if this fails
+    // Best-effort live sync — dashboard still renders from local data if this
+    // fails. allSettled so a failing affiliates fetch doesn't also block a
+    // successful products fetch (and vice versa) from being saved.
+    let syncWarning;
     if (locationId) {
-        try {
-            const [liveAffiliates, liveProducts] = await Promise.all([
-                fetchGHLAffiliates(locationId),
-                fetchGHLProducts(locationId)
-            ]);
+        const settled = await Promise.allSettled([
+            fetchGHLAffiliates(locationId),
+            fetchGHLProducts(locationId)
+        ]);
+        const dashLabels = ['affiliates', 'products'];
+        const dashErrors = [];
+        settled.forEach((r, i) => {
+            if (r.status === 'rejected') {
+                const err = r.reason;
+                const msg = err.response?.data?.message || err.message;
+                console.warn(`[dashboard] ${dashLabels[i]} sync failed for ${locationId}:`, msg);
+                dashErrors.push(`${dashLabels[i]}: ${msg}`);
+            }
+        });
+        if (dashErrors.length) syncWarning = dashErrors.join('; ');
+
+        const liveAffiliates = settled[0].status === 'fulfilled' ? settled[0].value : [];
+        const liveProducts   = settled[1].status === 'fulfilled' ? settled[1].value : [];
+        if (liveAffiliates.length || liveProducts.length) {
             const knownCampaigns = Object.values(db.campaigns || {}).filter(c => c.locationId === locationId);
             associateAffiliatesWithCampaigns(liveAffiliates, knownCampaigns);
             liveAffiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a }; });
             liveProducts.forEach(p => { db.products[p.id] = p; });
             saveDB(db);
-        } catch (err) {
-            console.warn(`[dashboard] GHL sync failed for ${locationId}:`, err.response?.data || err.message);
         }
     }
 
@@ -1046,7 +1118,8 @@ app.get('/api/dashboard/:campaignId', async (req, res) => {
         campaign,
         affiliates: enrichedAffiliates,
         transactions: recentTransactions,
-        products
+        products,
+        syncWarning
     });
 });
 
@@ -1549,11 +1622,16 @@ app.get('/api/debug-subscription/:locationId/:ghlSubId', async (req, res) => {
     const { locationId, ghlSubId } = req.params;
     try {
         const db = loadDB();
-        const [sub, ghlTxns, ghlAffiliates] = await Promise.all([
-            fetchGHLSubscriptionById(locationId, ghlSubId),
+        const sub = await fetchGHLSubscriptionById(locationId, ghlSubId);
+        const [txnsResult, affResult] = await Promise.allSettled([
             fetchGHLTransactions(locationId),
             fetchGHLAffiliates(locationId)
         ]);
+        const fetchWarnings = [];
+        if (txnsResult.status === 'rejected') fetchWarnings.push(`transactions: ${txnsResult.reason.response?.data?.message || txnsResult.reason.message}`);
+        if (affResult.status  === 'rejected') fetchWarnings.push(`affiliates: ${affResult.reason.response?.data?.message  || affResult.reason.message}`);
+        const ghlTxns       = txnsResult.status === 'fulfilled' ? txnsResult.value : [];
+        const ghlAffiliates = affResult.status  === 'fulfilled' ? affResult.value  : [];
 
         // Same scoping as the real sync — only this location's affiliates are candidates
         ghlAffiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a, locationId }; });
@@ -1584,7 +1662,8 @@ app.get('/api/debug-subscription/:locationId/:ghlSubId', async (req, res) => {
             earnings: affiliate ? {
                 cashThisWeek: computeAffiliateCash(db, affiliate.id, 7),
                 cashTotal:    computeAffiliateCash(db, affiliate.id, null)
-            } : null
+            } : null,
+            fetchWarnings: fetchWarnings.length ? fetchWarnings : undefined
         });
     } catch (err) {
         console.error('[debug-subscription] error:', err.response?.data || err.message);
