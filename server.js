@@ -2130,3 +2130,73 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'}`);
     runBootSyncOnce();
 });
+
+// ... existing code ...
+
+// IMPORTANT: Place this at the VERY END of server.js, 
+// after all your API routes (app.get('/api/...), etc.)
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, '0.0.0.0', () => console.log(`LEAF Server running on port ${PORT}`));
+```
+
+### 2. Update your `index.html`
+Modify your navigation logic. Instead of just hiding/showing, update the browser's URL using `history.pushState`.
+
+```html:LEAF Affiliate Manager:index.html
+<!-- ... existing code ... -->
+    <nav class="bg-white border-b border-gray-200 sticky top-0 z-50">
+        <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+            <!-- Update all links to use data-route attributes instead of inline onclick -->
+            <div class="flex items-center gap-2 cursor-pointer" data-route="home">
+                <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xl">L</div>
+                <span class="font-bold text-lg tracking-tight">LEAF</span>
+            </div>
+            <div class="flex items-center gap-6 text-sm font-medium text-gray-600">
+                <span class="cursor-pointer nav-link" data-route="home" id="link-home">Home</span>
+                <span class="cursor-pointer nav-link" data-route="support" id="link-support">Support</span>
+                <span class="cursor-pointer nav-link" data-route="privacy" id="link-privacy">Privacy</span>
+                <span class="cursor-pointer nav-link" data-route="terms" id="link-terms">Terms</span>
+                <a href="#" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded-lg transition-colors">Install App</a>
+            </div>
+        </div>
+    </nav>
+<!-- ... existing code ... -->
+    <script>
+        // SPA Router Logic
+        function navigate(pageId, pushState = true) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+            
+            const targetPage = document.getElementById('page-' + pageId);
+            const targetLink = document.getElementById('link-' + pageId);
+            
+            if (targetPage) targetPage.classList.add('active');
+            if (targetLink) targetLink.classList.add('active');
+            
+            if (pushState) {
+                window.history.pushState({ page: pageId }, '', '/' + (pageId === 'home' ? '' : pageId));
+            }
+            window.scrollTo(0, 0);
+        }
+
+        // Intercept clicks
+        document.querySelectorAll('[data-route]').forEach(el => {
+            el.addEventListener('click', () => navigate(el.getAttribute('data-route')));
+        });
+
+        // Handle Browser Back/Forward buttons
+        window.addEventListener('popstate', (event) => {
+            const page = event.state?.page || 'home';
+            navigate(page, false);
+        });
+
+        // Initialize on load based on URL
+        const path = window.location.pathname.replace('/', '') || 'home';
+        navigate(path, false);
+    </script>
+</body>
+</html>
