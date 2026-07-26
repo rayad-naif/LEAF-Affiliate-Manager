@@ -250,7 +250,7 @@
             <!-- Step 1: Sync -->
             <div class="bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-blue-700 mb-4 space-y-1">
                 <p class="font-semibold">How it works:</p>
-                <p>1. <strong>Sync Subscriptions</strong> — fetches all GHL subscriptions &amp; transactions and matches them to your affiliates.</p>
+                <p>1. Subscriptions &amp; transactions are synced automatically (on load, then every 5 min) and matched to your affiliates — <strong>Sync Subscriptions</strong> below is only needed for an immediate manual refresh.</p>
                 <p>2. The system checks each affiliated subscription 2 days after each billing renewal date.</p>
                 <p>3. If renewed → affiliate earns commission and next check is scheduled. If cancelled → tracking stops automatically.</p>
                 <p>4. Use <strong>Run Check Now</strong> anytime to immediately process all due subscriptions.</p>
@@ -343,6 +343,7 @@
             badge.classList.remove('hidden');
             badge.classList.add('flex');
             await loadCampaigns();
+            startAutoSync();
         } else {
             // Standalone context — show location picker
             showEmptyState();
@@ -412,6 +413,29 @@
             return;
         }
         await loadCampaigns();
+        startAutoSync();
+    }
+
+    // ── Automatic subscription/transaction watching — no manual click needed ──
+    // Runs once as soon as a location is active, then keeps re-checking every
+    // 5 minutes for as long as this tab stays open on that location. The
+    // "Sync Subscriptions" button still exists for an on-demand refresh, but
+    // it's no longer required to keep affiliate matching and renewals current.
+    let autoSyncTimer = null;
+    function startAutoSync() {
+        if (!locationId) return;
+        autoSyncSubscriptions();
+        clearInterval(autoSyncTimer);
+        autoSyncTimer = setInterval(autoSyncSubscriptions, 5 * 60 * 1000);
+    }
+    async function autoSyncSubscriptions() {
+        if (!locationId) return;
+        try {
+            await fetch(`/api/sync-subscriptions/${encodeURIComponent(locationId)}`, { method: 'POST' });
+        } catch (err) {
+            console.warn('autoSyncSubscriptions failed (non-fatal, will retry):', err.message);
+        }
+        loadWeeklyCheckStatus();
     }
 
     // ── Inline loading helpers (defensive — safe to call any time) ─────────
