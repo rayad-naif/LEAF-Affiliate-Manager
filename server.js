@@ -53,7 +53,8 @@ function loadDB() {
         // New: per-subscription tracking
         trackedSubscriptions: {},   // ghlSubId → tracked record
         contactAffiliateMap:  {},   // contactId → { affiliateId, affiliateName, locationId }
-        subscriptionCheckLog: []    // last N check run summaries
+        subscriptionCheckLog: [],   // last N check run summaries
+        autoRefreshLog:       []    // last N hourly full-sync (campaigns/products/affiliates/subs) summaries
     };
 }
 
@@ -68,6 +69,7 @@ function migrateDB() {
     if (!db.trackedSubscriptions) { db.trackedSubscriptions = {}; dirty = true; }
     if (!db.contactAffiliateMap)  { db.contactAffiliateMap  = {}; dirty = true; }
     if (!db.subscriptionCheckLog) { db.subscriptionCheckLog = []; dirty = true; }
+    if (!db.autoRefreshLog)       { db.autoRefreshLog       = []; dirty = true; }
     if (dirty) saveDB(db);
 }
 migrateDB();
@@ -292,17 +294,29 @@ async function fetchGHLCampaigns(locationId) {
     }));
 }
 
-// ─── GHL: Products ────────────────────────────────────────────────────────────
+// ─── GHL: Products (fully paginated — fetches every page, not just the first) ─
 async function fetchGHLProducts(locationId) {
-    const db  = loadDB();
-    const res = await ghlApiRequest(locationId, (token) => ({
-        method:  'get',
-        url:     `${GHL_API_BASE}/products/`,
-        params:  { locationId },
-        headers: ghlHeaders(token, GHL_API_VER_PRODUCTS),
-        timeout: 10000
-    }));
-    return (res.data.products || []).map(p => {
+    const db = loadDB();
+    const allProducts = [];
+    let offset = 0;
+    const limit = 100;
+
+    while (true) {
+        const res = await ghlApiRequest(locationId, (token) => ({
+            method:  'get',
+            url:     `${GHL_API_BASE}/products/`,
+            params:  { locationId, limit, offset },
+            headers: ghlHeaders(token, GHL_API_VER_PRODUCTS),
+            timeout: 10000
+        }));
+        const page = res.data.products || [];
+        allProducts.push(...page);
+        if (page.length < limit) break;
+        offset += limit;
+    }
+
+    console.log(`[products] fetched ${allProducts.length} product(s) for ${locationId}`);
+    return allProducts.map(p => {
         const id = p.id || p._id;
         const local = db.products[id] || {};
         return {
@@ -315,20 +329,34 @@ async function fetchGHLProducts(locationId) {
     });
 }
 
-// ─── GHL: Affiliate Manager — Affiliates ─────────────────────────────────────
+// ─── GHL: Affiliate Manager — Affiliates (fully paginated) ───────────────────
 async function fetchGHLAffiliates(locationId) {
-    const res = await ghlApiRequest(locationId, (token) => ({
-        method:  'get',
-        url:     `${GHL_API_BASE}/affiliate-manager/${locationId}/affiliates`,
-        headers: ghlHeaders(token, GHL_API_VER_V3),
-        timeout: 10000
-    }));
-    return (res.data.affiliates || []).map(a => ({
+    const allAffiliates = [];
+    let offset = 0;
+    const limit = 100;
+
+    while (true) {
+        const res = await ghlApiRequest(locationId, (token) => ({
+            method:  'get',
+            url:     `${GHL_API_BASE}/affiliate-manager/${locationId}/affiliates`,
+            params:  { limit, offset },
+            headers: ghlHeaders(token, GHL_API_VER_V3),
+            timeout: 10000
+        }));
+        const page = res.data.affiliates || [];
+        allAffiliates.push(...page);
+        if (page.length < limit) break;
+        offset += limit;
+    }
+
+    console.log(`[affiliates] fetched ${allAffiliates.length} affiliate(s) for ${locationId}`);
+    return allAffiliates.map(a => ({
         id:          a._id || a.id,
+        contactId:   a.contactId || a.contact_id || a.contact?._id || a.contact?.id || null,
         name:        `${a.firstName || ''} ${a.lastName || ''}`.trim() || a.email || a._id,
         email:       a.email || '',
         refId:       a.referralCode || a._id,
-        campaignIds: a.campaignIds  || [],
+        campaignIds: [...(a.campaignIds || [])],   // fresh mutable copy — associateAffiliatesWithCampaigns() appends to this
         campaignId:  (a.campaignIds || [])[0] || null,
         totalCash:     a.revenue    || 0,
         totalLeads:    a.lead       || 0,
@@ -340,6 +368,25 @@ async function fetchGHLAffiliates(locationId) {
         active:        a.active     !== false,
         locationId
     }));
+}
+
+// ─── Cross-reference: attach affiliates to the campaigns that list them ──────
+// Each campaign response includes `affiliates` (a list of affiliate IDs
+// belonging to that campaign — mapped to `affiliateIds` in fetchGHLCampaigns).
+// Some affiliate records come back from the affiliates endpoint without a
+// reliable campaignIds field of their own, so this rebuilds the association
+// from the campaign side and merges it onto each affiliate in place.
+function associateAffiliatesWithCampaigns(affiliates, campaigns) {
+    const byId = new Map(affiliates.map(a => [a.id, a]));
+    (campaigns || []).forEach(c => {
+        (c.affiliateIds || []).forEach(affId => {
+            const a = byId.get(affId);
+            if (!a) return;
+            if (!a.campaignIds.includes(c.id)) a.campaignIds.push(c.id);
+            if (!a.campaignId) a.campaignId = c.id;
+        });
+    });
+    return affiliates;
 }
 
 // ─── GHL: Payments — List Subscriptions ──────────────────────────────────────
@@ -472,11 +519,26 @@ function normalize(str) {
 // Returns { affiliate, source } where source is 'direct-id' | 'known-mapping' | 'fuzzy' | null,
 // so callers/debug tooling can see exactly why (or why not) a match happened.
 function matchAffiliate({ sub, affiliates, contactMap, relatedTxns }) {
-    // 1. Direct ID match — GHL told us exactly which affiliate this is
+    // 1. Direct ID match — GHL told us exactly which affiliate this is.
+    //    NOTE: entitySourceMeta.affiliateManager.id is NOT the affiliate's
+    //    Mongo _id / refId — it's a name-derived slug GHL generates, shaped
+    //    like "firstnamelastname1234" (lowercased first+last name glued
+    //    together, followed by a few random digits — e.g. "johndoe4821").
+    //    So try the literal id/refId match first, then fall back to a
+    //    name-based comparison using that same payload id.
     const payloadAffId = sub.entitySourceMeta?.affiliateManager?.id;
     if (payloadAffId) {
         const direct = affiliates.find(a => a.id === payloadAffId || a.refId === payloadAffId);
         if (direct) return { affiliate: direct, source: 'direct-id' };
+
+        // Strip the trailing digits GHL appends, normalize what's left (letters
+        // only, lowercased), and compare against each affiliate's normalized
+        // full name. "johndoe4821" → "johndoe" → matches affiliate "John Doe".
+        const idNameBase = normalize(payloadAffId.replace(/[0-9]+$/, ''));
+        if (idNameBase && idNameBase.length >= 4) {
+            const byName = affiliates.find(a => normalize(a.name) === idNameBase);
+            if (byName) return { affiliate: byName, source: 'direct-id-name' };
+        }
     }
 
     // 2. Known contact → affiliate mapping — only trusted if it resolves
@@ -490,10 +552,14 @@ function matchAffiliate({ sub, affiliates, contactMap, relatedTxns }) {
         // mapping points at an affiliate not in this location's roster — stale, ignore it
     }
 
-    // 3. Fuzzy match against name / email / referral code
+    // 3. Fuzzy match against name / email / referral code / the raw payload id
+    //    (kept here too as a safety net in case the name-slug doesn't exactly
+    //    equal the affiliate's normalized name — e.g. extra middle name, or
+    //    the affiliate's own name changed since the slug was generated).
     const haystack = normalize(
         (sub.contactName  || '') + ' ' +
         (sub.contactEmail || '') + ' ' +
+        (payloadAffId      || '') + ' ' +
         JSON.stringify(relatedTxns || '')
     );
 
@@ -517,6 +583,18 @@ function matchAffiliate({ sub, affiliates, contactMap, relatedTxns }) {
     return { affiliate: null, source: null };
 }
 
+// ─── Sum an affiliate's CASH transactions ─────────────────────────────────────
+// windowDays: number of trailing days to include (e.g. 7 for "this week"),
+// or null/undefined for all-time.
+function computeAffiliateCash(db, affiliateId, windowDays) {
+    if (!affiliateId) return 0;
+    const cutoff = windowDays ? Date.now() - windowDays * 24 * 60 * 60 * 1000 : null;
+    return Object.values(db.transactions || {})
+        .filter(t => t.affiliateId === affiliateId && t.type === 'CASH')
+        .filter(t => !cutoff || new Date(t.createdAt).getTime() >= cutoff)
+        .reduce((sum, t) => sum + Number(t.amount || 0), 0);
+}
+
 // ─── Sync subscriptions from GHL and match to affiliates ─────────────────────
 // This is the core of the system.
 // Steps:
@@ -534,17 +612,26 @@ async function syncSubscriptionsFromGHL(locationId) {
     if (!db.contactAffiliateMap)  db.contactAffiliateMap  = {};
     if (!db.affiliates)           db.affiliates           = {};
     if (!db.products)             db.products             = {};
+    if (!db.campaigns)            db.campaigns            = {};
     if (!db.transactions)         db.transactions          = {};
 
-    // Fetch everything we need in parallel
-    const [ghlSubs, ghlTxns, ghlAffiliates] = await Promise.all([
+    // Fetch everything we need in parallel — subscriptions, transactions,
+    // ALL affiliates (paginated), ALL products (paginated), and campaigns
+    // (so affiliates/products can be associated to the right campaign below).
+    const [ghlSubs, ghlTxns, ghlAffiliates, ghlProducts, ghlCampaigns] = await Promise.all([
         fetchGHLSubscriptions(locationId),
         fetchGHLTransactions(locationId),
-        fetchGHLAffiliates(locationId)
+        fetchGHLAffiliates(locationId),
+        fetchGHLProducts(locationId),
+        fetchGHLCampaigns(locationId)
     ]);
 
-    // Merge freshly-fetched affiliates into the local store so IDs/refIds are current
+    // Associate affiliates with the campaigns that list them, THEN merge into
+    // the local store so IDs/refIds/campaignIds are current.
+    associateAffiliatesWithCampaigns(ghlAffiliates, ghlCampaigns);
     ghlAffiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a, locationId }; });
+    ghlProducts.forEach(p  => { db.products[p.id]    = p; });
+    ghlCampaigns.forEach(c => { db.campaigns[c.id]   = c; });
 
     // ── Scope candidates to THIS location only ──────────────────────────────
     // Seed/demo affiliates (aff_1/aff_2/aff_3) have no locationId field at
@@ -581,6 +668,7 @@ async function syncSubscriptionsFromGHL(locationId) {
 
             const relatedTxns = txnsBySubId[subStripeId] || txnsBySubId[ghlSubId] || [];
             const { affiliate: affiliateRec, source: matchSource } = matchAffiliate({ sub, affiliates, contactMap, relatedTxns });
+
 
             // Remember this mapping so future syncs/checks resolve instantly
             // (only cache real, scoped matches — never cache a "no match")
@@ -625,6 +713,7 @@ async function syncSubscriptionsFromGHL(locationId) {
                 ghlSubId, stripeSubId: subStripeId, contactId, contactEmail,
                 contactName: sub.contactName || '',
                 locationId,
+                productId,
                 affiliateId:   affiliateRec?.id   || null,
                 affiliateName: affiliateRec?.name || null,
                 isAffiliated:  !!affiliateRec,
@@ -748,33 +837,94 @@ async function runSubscriptionChecks(locationIdFilter) {
                 result.action      = `renewed — next check: ${newNextCheck}`;
                 console.log(`[sub-check] ${tracked.contactEmail} (${tracked.billingInterval}) → RENEWED, next check: ${newNextCheck}`);
 
+                // ── Reward the affiliate again for this renewal, per the rules ──
+                // Only for subscriptions that are actually affiliated. checkCount
+                // was just incremented above, so it's a stable, unique cycle
+                // number for THIS renewal — using it in the tx id makes this
+                // idempotent (a re-run before the next due date can never
+                // double-pay the same renewal, since `due` requires
+                // nextCheckDate <= now, and nextCheckDate has already moved
+                // past "now" by the time this runs again).
+                if (rec.isAffiliated && rec.affiliateId) {
+                    const rule = rec.productId ? db.products[rec.productId] : null;
+                    if (rule && rule.payoutValue > 0) {
+                        const rewardTxId = `tx_renew_${tracked.ghlSubId}_${rec.checkCount}`;
+                        if (!db.transactions[rewardTxId]) {
+                            db.transactions[rewardTxId] = {
+                                id: rewardTxId,
+                                campaignId: rule.campaignId || db.affiliates[rec.affiliateId]?.campaignId || 'unknown',
+                                contactId: rec.contactId,
+                                affiliateId: rec.affiliateId,
+                                affiliateName: rec.affiliateName,
+                                productId: rec.productId,
+                                subscriptionId: tracked.ghlSubId,
+                                type: rule.payoutType || 'CASH',
+                                amount: rule.payoutValue,
+                                renewalCycle: rec.checkCount,
+                                createdAt: runAt
+                            };
+                            result.rewardCreated = { txId: rewardTxId, amount: rule.payoutValue, type: rule.payoutType || 'CASH' };
+                            console.log(`[sub-check] reward created for ${rec.affiliateName}: ${rule.payoutValue} (${rule.payoutType || 'CASH'}) — cycle ${rec.checkCount}`);
+                        }
+                    } else {
+                        result.rewardSkipped = rule
+                            ? 'product payout rule has no value configured'
+                            : 'no payout rule configured for this subscription\'s product — set one under Settings';
+                    }
+                }
+
                 // ── Push updated stats to CRM contact custom fields ─────────
                 const locationId     = tracked.locationId;
                 const customFieldIds = db.customFields?.[locationId] || {};
                 const affiliateRec   = Object.values(db.affiliates || {}).find(a => a.id === tracked.affiliateId);
 
-                if (affiliateRec && (customFieldIds.leads_this_week || customFieldIds.total_earned)) {
+                if (affiliateRec && (customFieldIds.leads_this_week || customFieldIds.total_earned || customFieldIds.cash_this_week)) {
                     try {
                         // Count active affiliated subscriptions as "leads" for this affiliate
                         const leadsCount = Object.values(db.trackedSubscriptions).filter(s =>
                             s.affiliateId === tracked.affiliateId && s.isActive && !s.stopped
                         ).length;
 
-                        const contact = await searchContactByEmail(locationId, affiliateRec.email);
-                        if (contact) {
+                        // Cash earned in the last 7 days vs. all-time — always from
+                        // LEAF's own local ledger (never GHL's native `revenue`
+                        // figure). Reconciling from locally-generated transaction
+                        // records, not trusting GHL's own totals, is the entire
+                        // point of this system.
+                        const cashThisWeek = computeAffiliateCash(db, tracked.affiliateId, 7);
+                        const cashTotal     = computeAffiliateCash(db, tracked.affiliateId, null);
+
+                        // Prefer the affiliate's own GHL contactId when the affiliate-manager
+                        // API returned one — an email search can silently miss/mismatch when
+                        // the affiliate has no email set, or the email differs from their
+                        // contact record. Fall back to email search only if we don't have it.
+                        let contactId = affiliateRec.contactId || null;
+                        if (!contactId && affiliateRec.email) {
+                            const contact = await searchContactByEmail(locationId, affiliateRec.email);
+                            contactId = contact?.id || contact?._id || null;
+                        }
+
+                        if (contactId) {
                             const fields = [];
                             if (customFieldIds.leads_this_week)
-                                fields.push({ id: customFieldIds.leads_this_week, fieldValue: String(leadsCount) });
+                                fields.push({ id: customFieldIds.leads_this_week, key: 'leads_this_week', fieldValue: String(leadsCount) });
+                            if (customFieldIds.cash_this_week)
+                                fields.push({ id: customFieldIds.cash_this_week, key: 'cash_this_week', fieldValue: String(cashThisWeek) });
                             if (customFieldIds.total_earned)
-                                fields.push({ id: customFieldIds.total_earned, fieldValue: String(affiliateRec.totalCash || 0) });
+                                fields.push({ id: customFieldIds.total_earned, key: 'total_earned', fieldValue: String(cashTotal) });
                             if (fields.length) {
-                                await updateContactCustomFields(locationId, contact.id || contact._id, fields);
+                                await updateContactCustomFields(locationId, contactId, fields);
                                 result.crmUpdated = true;
+                                result.crmContactId = contactId;
+                                result.cashThisWeek = cashThisWeek;
+                                result.cashTotal = cashTotal;
                             }
+                        } else {
+                            result.crmError = `No contact found for affiliate ${affiliateRec.name || affiliateRec.email || tracked.affiliateId}`;
+                            console.warn(`[sub-check] ${result.crmError}`);
                         }
                     } catch (crmErr) {
-                        result.crmError = crmErr.message;
-                        console.warn(`[sub-check] CRM update failed for ${affiliateRec?.email}:`, crmErr.message);
+                        result.crmError = crmErr.response?.data?.message || crmErr.message;
+                        console.warn(`[sub-check] CRM update failed for ${affiliateRec?.email}:`, result.crmError);
                     }
                 }
             }
@@ -817,6 +967,8 @@ app.get('/api/campaigns/:locationId', async (req, res) => {
             fetchGHLProducts(locationId)
         ]);
 
+        associateAffiliatesWithCampaigns(affiliates, campaigns);
+
         campaigns.forEach(c  => { db.campaigns[c.id]  = c; });
         affiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a }; });
         products.forEach(p   => { db.products[p.id]   = p; });
@@ -844,6 +996,8 @@ app.get('/api/dashboard/:campaignId', async (req, res) => {
                 fetchGHLAffiliates(locationId),
                 fetchGHLProducts(locationId)
             ]);
+            const knownCampaigns = Object.values(db.campaigns || {}).filter(c => c.locationId === locationId);
+            associateAffiliatesWithCampaigns(liveAffiliates, knownCampaigns);
             liveAffiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a }; });
             liveProducts.forEach(p => { db.products[p.id] = p; });
             saveDB(db);
@@ -1094,6 +1248,69 @@ app.get('/api/locations', (req, res) => {
     return res.json({ success: true, locations });
 });
 
+// ─── Auto-refresh: full sync (campaigns/products/affiliates/subscriptions) ───
+// for every installed location. This is what picks up brand-new subscriptions,
+// affiliates, products, and campaigns automatically — the renewal-check cron
+// only re-checks subscriptions that are ALREADY in trackedSubscriptions, so
+// without this step new signups would never get tracked until someone
+// manually clicked "Sync Subscriptions".
+function getAllInstalledLocationIds(db) {
+    const ids = Object.values(db.installs)
+        .filter(i => i.locationId && !i.locationId.startsWith('company_'))
+        .map(i => i.locationId);
+    return [...new Set(ids)];
+}
+
+async function autoRefreshAllLocations() {
+    const db = loadDB();
+    const locationIds = getAllInstalledLocationIds(db);
+    const runAt = new Date().toISOString();
+    const perLocation = [];
+
+    for (const locationId of locationIds) {
+        try {
+            const r = await syncSubscriptionsFromGHL(locationId);
+            perLocation.push({
+                locationId,
+                added: r.added.length,
+                updated: r.updated.length,
+                errors: r.errors.length,
+                rawCount: r.rawCount
+            });
+        } catch (err) {
+            const msg = err.response?.data?.message || err.message;
+            console.error(`[auto-refresh] sync failed for ${locationId}:`, msg);
+            perLocation.push({ locationId, error: msg });
+        }
+    }
+
+    const dbAfter = loadDB();
+    if (!dbAfter.autoRefreshLog) dbAfter.autoRefreshLog = [];
+    dbAfter.autoRefreshLog.unshift({ runAt, locations: perLocation });
+    if (dbAfter.autoRefreshLog.length > 20) dbAfter.autoRefreshLog.length = 20;
+    saveDB(dbAfter);
+
+    console.log(`[auto-refresh] complete for ${locationIds.length} location(s) at ${runAt}`);
+    return { runAt, locations: perLocation };
+}
+
+// ─── API: Manual trigger — run the full auto-refresh now (all locations) ─────
+app.post('/api/auto-refresh/run', async (req, res) => {
+    try {
+        const result = await autoRefreshAllLocations();
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[auto-refresh] manual trigger error:', err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// ─── API: Auto-refresh status/log ─────────────────────────────────────────────
+app.get('/api/auto-refresh/status', (req, res) => {
+    const db = loadDB();
+    res.json({ success: true, log: (db.autoRefreshLog || []).slice(0, 10) });
+});
+
 // ─── CRM: Search contact by email ────────────────────────────────────────────
 async function searchContactByEmail(locationId, email) {
     const res = await ghlApiRequest(locationId, (token) => ({
@@ -1170,8 +1387,9 @@ async function setupCustomFieldsForLocation(locationId) {
         }
     }
 
-    await ensureField('Leads This Week', 'leads_this_week');
-    await ensureField('Total Earned',    'total_earned');
+    await ensureField('Leads This Week',        'leads_this_week');
+    await ensureField('Total Earned This Week', 'cash_this_week');
+    await ensureField('Total Earned',           'total_earned');
     return results;
 }
 
@@ -1241,9 +1459,19 @@ app.get('/api/debug-subscription/:locationId/:ghlSubId', async (req, res) => {
             rawSubscription: sub,
             relatedTransactions: relatedTxns,
             scopedAffiliateCount: affiliates.length,
-            scopedAffiliates: affiliates.map(a => ({ id: a.id, name: a.name, email: a.email, refId: a.refId })),
+            scopedAffiliates: affiliates.map(a => ({ id: a.id, contactId: a.contactId || null, name: a.name, email: a.email, refId: a.refId })),
             cachedContactMapping: cachedMapping,
-            matchResult: { matchedAffiliateId: affiliate?.id || null, matchedAffiliateName: affiliate?.name || null, source }
+            payloadAffiliateManagerId: sub.entitySourceMeta?.affiliateManager?.id || null,
+            matchResult: {
+                matchedAffiliateId:   affiliate?.id   || null,
+                matchedAffiliateName: affiliate?.name || null,
+                matchedAffiliateContactId: affiliate?.contactId || null,
+                source
+            },
+            earnings: affiliate ? {
+                cashThisWeek: computeAffiliateCash(db, affiliate.id, 7),
+                cashTotal:    computeAffiliateCash(db, affiliate.id, null)
+            } : null
         });
     } catch (err) {
         console.error('[debug-subscription] error:', err.response?.data || err.message);
@@ -1389,8 +1617,15 @@ app.get('/api/weekly-check/status', (req, res) => {
     res.redirect('/api/subscription-check/status');
 });
 
-// ─── Hourly cron: check due subscription renewals ─────────────────────────────
+// ─── Hourly cron: auto-refresh (full sync) + check due subscription renewals ──
 cron.schedule('0 * * * *', async () => {
+    console.log('[cron] Hourly auto-refresh — syncing campaigns/products/affiliates/subscriptions for all locations');
+    try {
+        await autoRefreshAllLocations();
+    } catch (err) {
+        console.error('[cron] Auto-refresh failed:', err.message);
+    }
+
     console.log('[cron] Hourly subscription renewal check');
     try {
         await runSubscriptionChecks(null);
@@ -1403,7 +1638,7 @@ cron.schedule('0 * * * *', async () => {
 app.get('/health', (req, res) => {
     res.json({
         status:  'ok',
-        version: 'CRM API v2 | Subscription Tracker v2',
+        version: 'CRM API v2 | Subscription Tracker v3 (auto-refresh + recurring rewards)',
         time:    new Date().toISOString(),
         callbackUrl: process.env.GHL_REDIRECT_URI || '(redirect URI not set)'
     });
