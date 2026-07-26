@@ -560,6 +560,16 @@ function matchAffiliate({ sub, affiliates, contactMap, relatedTxns }) {
         if (idNameBase && idNameBase.length >= 4) {
             const byName = affiliates.find(a => normalize(a.name) === idNameBase);
             if (byName) return { affiliate: byName, source: 'direct-id-name' };
+
+            // Tolerant fallback: the slug can be truncated, or the affiliate's
+            // stored name can have an extra/missing middle name — allow a
+            // startsWith match either direction, still gated by a minimum
+            // length so short names can't false-positive.
+            const byPartialName = affiliates.find(a => {
+                const aName = normalize(a.name);
+                return aName.length >= 6 && (aName.startsWith(idNameBase) || idNameBase.startsWith(aName));
+            });
+            if (byPartialName) return { affiliate: byPartialName, source: 'direct-id-name-partial' };
         }
     }
 
