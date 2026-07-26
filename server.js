@@ -267,6 +267,11 @@ async function ghlApiRequest(locationId, buildConfig, { retries429 = 0 } = {}) {
             return ghlApiRequest(locationId, buildConfig, { retries429: retries429 + 1 });
         }
 
+        // Log exactly what we sent whenever a call fails and isn't retried —
+        // this is what tells us the real cause (e.g. an unsupported param)
+        // from the server log in one look, instead of guessing blind.
+        console.error(`[ghl-api] ${status || 'ERR'} on ${config.method?.toUpperCase()} ${config.url} — params: ${JSON.stringify(config.params)} — ${err.response?.data?.message || err.message}`);
+
         throw err;
     }
 }
