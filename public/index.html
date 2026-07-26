@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LEAF | Affiliate Manager</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
+        .tab-active { border-bottom: 2px solid #2563eb; color: #2563eb; }
+        .tab-inactive { border-bottom: 2px solid transparent; color: #6b7280; }
+        .tab-inactive:hover { color: #374151; border-bottom: 2px solid #d1d5db; }
+        .section-hidden { display: none !important; }
+        .spinner { animation: spin 1s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="text-gray-800 h-screen flex flex-col">
+
+<!-- ── Nav ───────────────────────────────────────────────────────────────── -->
+<nav class="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between shadow-sm">
+    <div class="flex items-center gap-3">
+        <div class="w-8 h-8 bg-blue-600 text-white rounded-lg flex items-center justify-center font-bold text-xl">L</div>
+        <h1 class="text-xl font-bold text-gray-900">LEAF | Affiliate Manager</h1>
+    </div>
+
+    <div class="flex items-center gap-4 flex-wrap justify-end">
+        <!-- Location Selector (hidden when locationId comes from URL) -->
+        <div id="locationSelectorWrap" class="hidden flex items-center gap-2">
+            <label class="text-sm font-medium text-gray-600 whitespace-nowrap">Location:</label>
+            <div class="relative">
+                <select id="locationSelect"
+                        onchange="onLocationChange()"
+                        class="appearance-none bg-white border border-gray-300 text-gray-800 text-sm rounded-lg pl-3 pr-8 py-2 min-w-[200px] shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 cursor-pointer">
+                    <option value="">Loading locations…</option>
+                </select>
+                <div class="pointer-events-none absolute inset-y-0 right-2 flex items-center">
+                    <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                </div>
+            </div>
+        </div>
+
+        <!-- Location badge (shown when locationId comes from URL) -->
+        <div id="locationBadge" class="hidden items-center gap-2 bg-gray-50 border border-gray-200 px-3 py-1.5 rounded-lg text-xs text-gray-600">
+            <svg class="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/>
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/>
+            </svg>
+            <span id="locationBadgeText" class="font-mono"></span>
+        </div>
+
+        <!-- Campaign Selector -->
+        <div class="flex items-center gap-3">
+            <label class="text-sm font-medium text-gray-600 whitespace-nowrap">Campaign:</label>
+            <div class="relative">
+                <select id="campaignSelect"
+                        onchange="onCampaignChange()"
+                        class="appearance-none bg-white border border-gray-300 text-gray-800 text-sm rounded-lg pl-3 pr-8 py-2 min-w-[220px] shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 cursor-pointer">
+                    <option value="">Select a location first…</option>
+                </select>
+                <!-- chevron icon -->
+                <div class="pointer-events-none absolute inset-y-0 right-2 flex items-center">
+                    <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                </div>
+            </div>
+            <!-- Refresh icon button -->
+            <button onclick="loadCampaigns(true)" title="Refresh campaigns from CRM"
+                    class="p-2 rounded-lg border border-gray-200 hover:bg-gray-50 text-gray-500 hover:text-blue-600 transition-colors">
+                <svg id="refreshIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+            </button>
+            <!-- Campaign source badge -->
+            <span id="campaignSourceBadge" class="hidden text-xs px-2 py-1 rounded-full font-medium"></span>
+
+            <!-- Diagnostics toggle -->
+            <button onclick="toggleDiagnostics()" title="Show diagnostics"
+                    class="p-2 rounded-lg border border-gray-200 hover:bg-gray-50 text-gray-500 hover:text-blue-600 transition-colors">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+            </button>
+        </div>
+    </div>
+</nav>
+
+<div class="max-w-7xl mx-auto w-full flex-grow p-6">
+
+    <!-- ── Tabs ─────────────────────────────────────────────────────────── -->
+    <div class="flex space-x-8 border-b border-gray-200 mb-6">
+        <button onclick="switchTab('dashboard')" id="tab-dashboard" class="tab-active pb-3 font-medium transition-colors">Dashboard</button>
+        <button onclick="switchTab('affiliates')" id="tab-affiliates" class="tab-inactive pb-3 font-medium transition-colors">Affiliates</button>
+        <button onclick="switchTab('transactions')" id="tab-transactions" class="tab-inactive pb-3 font-medium transition-colors">Transactions</button>
+        <button onclick="switchTab('settings')" id="tab-settings" class="tab-inactive pb-3 font-medium transition-colors">Products &amp; Rules</button>
+    </div>
+
+    <!-- ── Empty state (no campaign selected) ───────────────────────────── -->
+    <div id="section-empty" class="section-hidden flex flex-col items-center justify-center py-24 text-gray-400">
+        <svg class="w-16 h-16 mb-4 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                  d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+        </svg>
+        <p class="text-lg font-medium text-gray-500">Select a campaign to view statistics</p>
+        <p class="text-sm mt-1">Choose a campaign from the dropdown in the top navigation.</p>
+    </div>
+
+    <!-- ── Dashboard ────────────────────────────────────────────────────── -->
+    <div id="section-dashboard" class="section-hidden space-y-6">
+        <!-- Campaign info bar -->
+        <div id="campaignInfoBar" class="flex items-center gap-3 bg-blue-50 border border-blue-100 px-4 py-3 rounded-xl text-sm text-blue-700 font-medium"></div>
+
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                <p class="text-sm text-gray-500 font-medium">Total Affiliates</p>
+                <p class="text-3xl font-bold mt-2 text-gray-900" id="stat-total-affiliates">—</p>
+            </div>
+            <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                <p class="text-sm text-gray-500 font-medium">Total Leads</p>
+                <p class="text-3xl font-bold mt-2 text-blue-600" id="stat-leads-week">—</p>
+            </div>
+            <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                <p class="text-sm text-gray-500 font-medium">Total Revenue</p>
+                <p class="text-3xl font-bold mt-2 text-green-600" id="stat-cash-week">—</p>
+            </div>
+            <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                <p class="text-sm text-gray-500 font-medium">Total Transactions</p>
+                <p class="text-3xl font-bold mt-2 text-gray-900" id="stat-transactions">—</p>
+            </div>
+        </div>
+
+        <!-- Recent activity mini-table on dashboard -->
+        <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+            <div class="p-6 border-b border-gray-100 flex justify-between items-center">
+                <h2 class="text-lg font-bold">Recent Activity</h2>
+                <button onclick="switchTab('transactions')" class="text-sm text-blue-600 hover:underline">View all →</button>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="bg-gray-50 text-gray-500 text-sm">
+                            <th class="p-4 font-medium">Date</th>
+                            <th class="p-4 font-medium">Affiliate</th>
+                            <th class="p-4 font-medium">Product</th>
+                            <th class="p-4 font-medium">Type</th>
+                            <th class="p-4 font-medium">Amount</th>
+                        </tr>
+                    </thead>
+                    <tbody id="dashboard-recent-tbody" class="divide-y divide-gray-100 text-sm">
+                        <tr><td colspan="5" class="p-6 text-center text-gray-400">Loading…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Affiliates ────────────────────────────────────────────────────── -->
+    <div id="section-affiliates" class="section-hidden bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+        <div class="p-6 border-b border-gray-100 flex justify-between items-center">
+            <h2 class="text-lg font-bold">Affiliate Roster</h2>
+            <button class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm transition-colors" onclick="refreshDashboard()">Refresh</button>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse">
+                <thead>
+                    <tr class="bg-gray-50 text-gray-500 text-sm">
+                        <th class="p-4 font-medium">Name / Email</th>
+                        <th class="p-4 font-medium">Status</th>
+                        <th class="p-4 font-medium">Ref ID</th>
+                        <th class="p-4 font-medium">Leads / Sales</th>
+                        <th class="p-4 font-medium">Total Earned</th>
+                    </tr>
+                </thead>
+                <tbody id="affiliates-tbody" class="divide-y divide-gray-100 text-sm">
+                    <tr><td colspan="4" class="p-6 text-center text-gray-400">Select a campaign above.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- ── Transactions ──────────────────────────────────────────────────── -->
+    <div id="section-transactions" class="section-hidden bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+        <div class="p-6 border-b border-gray-100">
+            <h2 class="text-lg font-bold">Transactions</h2>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse">
+                <thead>
+                    <tr class="bg-gray-50 text-gray-500 text-sm">
+                        <th class="p-4 font-medium">Date</th>
+                        <th class="p-4 font-medium">Affiliate</th>
+                        <th class="p-4 font-medium">Product ID</th>
+                        <th class="p-4 font-medium">Reward Type</th>
+                        <th class="p-4 font-medium">Amount</th>
+                    </tr>
+                </thead>
+                <tbody id="transactions-tbody" class="divide-y divide-gray-100 text-sm">
+                    <tr><td colspan="5" class="p-6 text-center text-gray-400">Select a campaign above.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- ── Products & Rules ──────────────────────────────────────────────── -->
+    <div id="section-settings" class="section-hidden max-w-3xl space-y-6">
+        <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+            <h2 class="text-lg font-bold mb-1">Campaign Products</h2>
+            <p class="text-sm text-gray-500 mb-6">Configure how affiliates are rewarded when their referrals purchase these products.</p>
+            <div id="products-list" class="space-y-4">
+                <p class="text-gray-400 text-sm py-4">Select a campaign to view its products.</p>
+            </div>
+        </div>
+
+        <!-- ── CRM Custom Fields Setup ──────────────────────────────────── -->
+        <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+            <h2 class="text-lg font-bold mb-1">CRM Custom Fields</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                Create the <strong>Leads This Week</strong> and <strong>Total Earned</strong> contact fields in your CRM.
+                Once created, you can build CRM workflows that trigger on field-value-changed and send email notifications to your account admin automatically.
+            </p>
+            <div class="bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-blue-700 mb-4 space-y-1">
+                <p class="font-semibold">How it works:</p>
+                <p>1. Click <em>Create Custom Fields</em> below — this adds two Number fields to every contact in your CRM location.</p>
+                <p>2. In your CRM, create a workflow with trigger <em>Contact field value changed</em> → filter for <em>Leads This Week</em> or <em>Total Earned</em>.</p>
+                <p>3. Add a <em>Send Email</em> action to notify the account admin whenever these values update each week.</p>
+            </div>
+            <div class="flex items-center gap-3">
+                <button id="setupFieldsBtn" onclick="setupCustomFields()"
+                        class="bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm px-4 py-2.5 transition-colors">
+                    Create Custom Fields
+                </button>
+                <span id="setupFieldsStatus" class="text-sm text-gray-500"></span>
+            </div>
+        </div>
+
+        <!-- ── Subscription Tracker ────────────────────────────────────── -->
+        <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+            <h2 class="text-lg font-bold mb-1">Subscription Renewal Tracker</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                Pulls all subscriptions from GHL, identifies which are affiliated, and checks each one
+                <strong>2 days after its renewal date</strong> to confirm it's still active.
+                Affiliated subscribers earn the affiliate a recurring commission each cycle. Cancelled subscriptions stop automatically.
+            </p>
+
+            <!-- Step 1: Sync -->
+            <div class="bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-blue-700 mb-4 space-y-1">
+                <p class="font-semibold">How it works:</p>
+                <p>1. <strong>Sync Subscriptions</strong> — fetches all GHL subscriptions &amp; transactions and matches them to your affiliates.</p>
+                <p>2. The system checks each affiliated subscription 2 days after each billing renewal date.</p>
+                <p>3. If renewed → affiliate earns commission and next check is scheduled. If cancelled → tracking stops automatically.</p>
+                <p>4. Use <strong>Run Check Now</strong> anytime to immediately process all due subscriptions.</p>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-3 mb-5">
+                <button id="syncSubsBtn" onclick="syncSubscriptions()"
+                        class="bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm px-4 py-2.5 transition-colors">
+                    Sync Subscriptions from GHL
+                </button>
+                <button id="weeklyRunBtn" onclick="runWeeklyCheck()"
+                        class="bg-green-600 hover:bg-green-700 text-white font-medium rounded-lg text-sm px-4 py-2.5 transition-colors">
+                    Run Check Now
+                </button>
+                <span id="weeklyRunStatus" class="text-sm text-gray-500"></span>
+            </div>
+
+            <!-- Subscription table -->
+            <div id="weeklyCheckLog" class="space-y-2 text-xs text-gray-600"></div>
+        </div>
+    </div>
+
+</div>
+
+<!-- ── Inline loading state (shown inside dashboard) ─────────────────────── -->
+<div id="inlineLoading" class="section-hidden bg-white rounded-xl border border-gray-100 p-12 text-center">
+    <svg class="spinner w-8 h-8 text-blue-600 mx-auto mb-3" fill="none" viewBox="0 0 24 24">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+    </svg>
+    <span class="text-sm font-medium text-gray-600">Loading campaign data…</span>
+    <div id="inlineLoadingError" class="section-hidden mt-4 text-left">
+        <p id="inlineLoadingErrorText" class="text-sm text-red-600 mb-3"></p>
+        <button onclick="retryDashboard()" class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors">
+            Retry
+        </button>
+    </div>
+</div>
+
+<!-- ── Diagnostics footer (helps debug stuck loading states) ─────────────── -->
+<div id="diagnostics" class="fixed bottom-4 right-4 z-40 max-w-sm w-full hidden">
+    <div class="bg-gray-900 text-white text-xs rounded-xl shadow-lg p-4 space-y-1">
+        <div class="flex justify-between items-center mb-2">
+            <span class="font-bold text-gray-300">Diagnostics</span>
+            <button onclick="document.getElementById('diagnostics').classList.add('hidden')" class="text-gray-400 hover:text-white">✕</button>
+        </div>
+        <div class="flex justify-between"><span class="text-gray-400">Location:</span><span id="diagLocation" class="font-mono text-right truncate max-w-[60%]">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Campaign:</span><span id="diagCampaign" class="font-mono text-right truncate max-w-[60%]">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Last call:</span><span id="diagLastCall" class="text-right truncate max-w-[60%]">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Status:</span><span id="diagStatus" class="text-right">—</span></div>
+        <div id="diagError" class="hidden mt-2 pt-2 border-t border-gray-700 text-red-300 text-[10px] leading-tight break-words"></div>
+    </div>
+</div>
+
+<script>
+    // ── State ────────────────────────────────────────────────────────────────
+    const urlParams  = new URLSearchParams(window.location.search);
+    const urlLocId   = urlParams.get('locationId');   // set by CRM iframe context
+    let   locationId = urlLocId || '';                // active location
+    let   currentCampaign = null;   // { id, name }
+    let   dashboardData   = null;   // latest fetched data
+
+    // ── Tab switching ────────────────────────────────────────────────────────
+    function switchTab(tabName) {
+        ['dashboard', 'affiliates', 'transactions', 'settings'].forEach(name => {
+            document.getElementById(`section-${name}`).classList.add('section-hidden');
+            document.getElementById(`tab-${name}`).className = 'tab-inactive pb-3 font-medium transition-colors';
+        });
+        document.getElementById(`section-${tabName}`).classList.remove('section-hidden');
+        document.getElementById(`tab-${tabName}`).className = 'tab-active pb-3 font-medium transition-colors';
+        if (tabName === 'settings') loadWeeklyCheckStatus();
+    }
+
+    // ── Boot: resolve location then load campaigns ───────────────────────────
+    async function boot() {
+        // Hard-reset visual state before any async work
+        currentCampaign = null;
+        dashboardData   = null;
+        ['dashboard', 'affiliates', 'transactions', 'settings'].forEach(n => {
+            document.getElementById(`section-${n}`).classList.add('section-hidden');
+        });
+        document.getElementById('section-empty').classList.add('section-hidden');
+        hideLoading();
+
+        if (urlLocId) {
+            // CRM iframe context — location is fixed; show badge, hide picker
+            locationId = urlLocId;
+            const badge = document.getElementById('locationBadge');
+            document.getElementById('locationBadgeText').textContent = locationId;
+            badge.classList.remove('hidden');
+            badge.classList.add('flex');
+            await loadCampaigns();
+        } else {
+            // Standalone context — show location picker
+            showEmptyState();
+            await loadLocations();
+        }
+    }
+
+    // ── Load installed locations ─────────────────────────────────────────────
+    async function loadLocations() {
+        const wrap   = document.getElementById('locationSelectorWrap');
+        const select = document.getElementById('locationSelect');
+        const campSelect = document.getElementById('campaignSelect');
+
+        wrap.classList.remove('hidden');
+        wrap.classList.add('flex');
+
+        try {
+            updateDiagnostics('/api/locations', 'loading');
+            const res  = await fetch('/api/locations');
+            const body = await res.json();
+            const locs = body.locations || [];
+
+            select.innerHTML = '';
+
+            if (locs.length === 0) {
+                select.innerHTML = '<option value="">No locations installed</option>';
+                campSelect.innerHTML = '<option value="">No location installed — complete OAuth first</option>';
+                updateDiagnostics('/api/locations', 'ok', 'No locations installed');
+                return;
+            }
+
+            const ph = document.createElement('option');
+            ph.value = '';
+            ph.textContent = `${locs.length} location${locs.length > 1 ? 's' : ''} — select one`;
+            select.appendChild(ph);
+
+            locs.forEach(l => {
+                const opt = document.createElement('option');
+                opt.value = l.locationId;
+                opt.textContent = l.locationId;
+                select.appendChild(opt);
+            });
+            updateDiagnostics('/api/locations', 'ok', `${locs.length} location(s)`);
+
+            // If exactly one location, auto-select it
+            if (locs.length === 1) {
+                select.value = locs[0].locationId;
+                await onLocationChange();
+            }
+        } catch (err) {
+            console.error('loadLocations error:', err);
+            select.innerHTML = '<option value="">Error loading locations</option>';
+            updateDiagnostics('/api/locations', 'error', err.message);
+        }
+    }
+
+    // ── Location dropdown changed ─────────────────────────────────────────────
+    async function onLocationChange() {
+        const select = document.getElementById('locationSelect');
+        locationId   = select.value;
+        currentCampaign = null;
+        showEmptyState();
+
+        if (!locationId) {
+            document.getElementById('campaignSelect').innerHTML = '<option value="">Select a location first…</option>';
+            document.getElementById('campaignSourceBadge').classList.add('hidden');
+            return;
+        }
+        await loadCampaigns();
+    }
+
+    // ── Inline loading helpers (defensive — safe to call any time) ─────────
+    function hideLoading() {
+        document.getElementById('inlineLoading').classList.add('section-hidden');
+    }
+    function showLoading() {
+        document.getElementById('inlineLoading').classList.remove('section-hidden');
+    }
+    // Hard safety net: if loading is still showing after 10s, show a retry button and error banner
+    let loadingSafetyTimer;
+    function startLoadingSafety() {
+        clearTimeout(loadingSafetyTimer);
+        loadingSafetyTimer = setTimeout(() => {
+            showInlineLoadingError('Loading is taking too long. The dashboard may be unavailable.');
+            showErrorBanner('Loading took too long. Please retry or refresh the page.');
+        }, 10000);
+    }
+    function stopLoadingSafety() {
+        clearTimeout(loadingSafetyTimer);
+    }
+    function showInlineLoadingError(msg) {
+        const errDiv = document.getElementById('inlineLoadingError');
+        document.getElementById('inlineLoadingErrorText').textContent = msg;
+        errDiv.classList.remove('section-hidden');
+    }
+    function hideInlineLoadingError() {
+        document.getElementById('inlineLoadingError').classList.add('section-hidden');
+    }
+
+    // ── Load campaigns from server (which proxies CRM with local fallback) ──
+    async function loadCampaigns(forceRefresh = false) {
+        if (!locationId) return;
+
+        const select   = document.getElementById('campaignSelect');
+        const icon     = document.getElementById('refreshIcon');
+        const badge    = document.getElementById('campaignSourceBadge');
+
+        if (forceRefresh) icon.classList.add('spinner');
+
+        try {
+            updateDiagnostics(`/api/campaigns/${locationId}`, 'loading');
+            const res  = await fetch(`/api/campaigns/${locationId}`);
+            const body = await res.json();
+
+            if (!body.success) throw new Error(body.error || 'Failed to load campaigns');
+
+            const campaigns = body.campaigns || [];
+
+            // Rebuild the <select> options
+            select.innerHTML = '';
+            if (campaigns.length === 0) {
+                select.innerHTML = '<option value="">No campaigns found</option>';
+                badge.textContent = 'No campaigns';
+                badge.className = 'text-xs px-2 py-1 rounded-full font-medium bg-yellow-100 text-yellow-700';
+                badge.classList.remove('hidden');
+                // Always clear any stale loading spinner when there's nothing to load
+                hideLoading();
+                showEmptyState();
+                updateDiagnostics(`/api/campaigns/${locationId}`, 'ok', 'No campaigns found');
+                return;
+            }
+
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.textContent = `${campaigns.length} campaign${campaigns.length > 1 ? 's' : ''} — select one`;
+            select.appendChild(placeholder);
+
+            campaigns.forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c.id;
+                opt.textContent = c.name;
+                select.appendChild(opt);
+            });
+
+            updateDiagnostics(`/api/campaigns/${locationId}`, 'ok', `${campaigns.length} campaign(s) from ${body.source}`);
+
+            // Show source badge
+            if (body.source === 'local') {
+                badge.textContent = 'Local cache';
+                badge.className = 'text-xs px-2 py-1 rounded-full font-medium bg-amber-100 text-amber-700';
+            } else {
+                badge.textContent = 'Live from CRM';
+                badge.className = 'text-xs px-2 py-1 rounded-full font-medium bg-green-100 text-green-700';
+            }
+            badge.classList.remove('hidden');
+
+            // Auto-select the first campaign if none is selected
+            if (!currentCampaign && campaigns.length > 0) {
+                select.value = campaigns[0].id;
+                // Use the select's value directly rather than reading it again via onCampaignChange
+                // to avoid a double-fire if the browser also raises a change event
+                const id   = campaigns[0].id;
+                const name = campaigns[0].name;
+                currentCampaign = { id, name };
+                await refreshDashboard();
+            }
+
+        } catch (err) {
+            console.error('loadCampaigns error:', err);
+            updateDiagnostics(`/api/campaigns/${locationId}`, 'error', err.message);
+            select.innerHTML = '<option value="">Error loading campaigns</option>';
+            badge.textContent = 'Error';
+            badge.className = 'text-xs px-2 py-1 rounded-full font-medium bg-red-100 text-red-700';
+            badge.classList.remove('hidden');
+            hideLoading();
+            showEmptyState();
+        } finally {
+            icon.classList.remove('spinner');
+        }
+    }
+
+    // ── Campaign dropdown changed ────────────────────────────────────────────
+    function onCampaignChange() {
+        const select = document.getElementById('campaignSelect');
+        const id     = select.value;
+        const name   = id ? select.options[select.selectedIndex].textContent : '';
+
+        if (!id) {
+            currentCampaign = null;
+            showEmptyState();
+            return;
+        }
+
+        currentCampaign = { id, name };
+        refreshDashboard();
+    }
+
+    // ── Show empty (no campaign selected) state ──────────────────────────────
+    function showEmptyState() {
+        ['dashboard', 'affiliates', 'transactions', 'settings'].forEach(n =>
+            document.getElementById(`section-${n}`).classList.add('section-hidden'));
+        document.getElementById('section-empty').classList.remove('section-hidden');
+    }
+
+    // ── Fetch dashboard data for current campaign ────────────────────────────
+    async function refreshDashboard() {
+        if (!currentCampaign) return;
+
+        hideErrorBanner();
+        hideInlineLoadingError();
+        // Hide all sections, show inline loading instead of full-screen blocking overlay
+        ['dashboard', 'affiliates', 'transactions', 'settings'].forEach(n =>
+            document.getElementById(`section-${n}`).classList.add('section-hidden'));
+        document.getElementById('section-empty').classList.add('section-hidden');
+        showLoading();
+        startLoadingSafety();
+        updateDiagnostics(`/api/dashboard/${currentCampaign.id}`, 'loading');
+
+        try {
+            const url = `/api/dashboard/${currentCampaign.id}?locationId=${encodeURIComponent(locationId)}`;
+            updateDiagnostics(url, 'loading');
+            const res  = await fetch(url);
+            const data = await res.json();
+            if (!data.success) throw new Error(data.error || 'Failed to load data');
+            dashboardData = data;
+            renderAll(data);
+            updateDiagnostics(`/api/dashboard/${currentCampaign.id}`, 'ok');
+        } catch (err) {
+            console.error('refreshDashboard error:', err);
+            updateDiagnostics(`/api/dashboard/${currentCampaign.id}`, 'error', err.message);
+            // Use inline banner instead of alert() — alert() is blocked in CRM iframes
+            showErrorBanner('Failed to load campaign data: ' + err.message);
+            showInlineLoadingError(err.message);
+            showEmptyState();
+        } finally {
+            hideLoading();
+            stopLoadingSafety();
+        }
+    }
+
+    // ── Diagnostics panel toggle ─────────────────────────────────────────────
+    function toggleDiagnostics() {
+        const panel = document.getElementById('diagnostics');
+        panel.classList.toggle('hidden');
+        if (!panel.classList.contains('hidden')) {
+            updateDiagnostics(currentCampaign ? `/api/dashboard/${currentCampaign.id}` : 'none', 'info');
+        }
+    }
+
+    // ── Diagnostics helper ───────────────────────────────────────────────────
+    function updateDiagnostics(apiPath, status, errorMessage) {
+        const panel = document.getElementById('diagnostics');
+        panel.classList.remove('hidden');
+        document.getElementById('diagLocation').textContent = locationId || '(none)';
+        document.getElementById('diagCampaign').textContent = currentCampaign ? `${currentCampaign.name} (${currentCampaign.id})` : '(none)';
+        document.getElementById('diagLastCall').textContent = apiPath;
+        document.getElementById('diagStatus').textContent = status;
+        const errEl = document.getElementById('diagError');
+        if (errorMessage) {
+            errEl.textContent = errorMessage;
+            errEl.classList.remove('hidden');
+        } else {
+            errEl.classList.add('hidden');
+        }
+    }
+
+    // ── Retry loading dashboard (used by inline loading error UI) ──────────
+    function retryDashboard() {
+        if (!currentCampaign) return;
+        document.getElementById('inlineLoadingError').classList.add('section-hidden');
+        refreshDashboard();
+    }
+
+    // ── Inline error banner (no alert/confirm needed) ────────────────────────
+    function showErrorBanner(msg) {
+        let banner = document.getElementById('errorBanner');
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.id = 'errorBanner';
+            banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-red-600 text-white text-sm font-medium px-5 py-3 rounded-xl shadow-lg flex items-center gap-3 max-w-lg w-full mx-4';
+            banner.innerHTML = `
+                <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                </svg>
+                <span id="errorBannerText" class="flex-1"></span>
+                <button onclick="hideErrorBanner()" class="ml-2 hover:opacity-75">✕</button>`;
+            document.body.appendChild(banner);
+        }
+        document.getElementById('errorBannerText').textContent = msg;
+        banner.classList.remove('hidden');
+        // Auto-dismiss after 8 s
+        clearTimeout(banner._dismissTimer);
+        banner._dismissTimer = setTimeout(hideErrorBanner, 8000);
+    }
+    function hideErrorBanner() {
+        const b = document.getElementById('errorBanner');
+        if (b) b.classList.add('hidden');
+    }
+
+    // ── Render everything ────────────────────────────────────────────────────
+    function renderAll(data) {
+        renderCampaignInfoBar();
+        renderStats(data);
+        renderRecentActivity(data.transactions);
+        renderAffiliates(data.affiliates);
+        renderTransactions(data.transactions);
+        renderProducts(data.products);
+
+        // Hide empty state and all non-dashboard sections, show dashboard
+        document.getElementById('section-empty').classList.add('section-hidden');
+        document.getElementById('section-dashboard').classList.remove('section-hidden');
+        document.getElementById('tab-dashboard').className = 'tab-active pb-3 font-medium transition-colors';
+        ['affiliates', 'transactions', 'settings'].forEach(n => {
+            document.getElementById(`section-${n}`).classList.add('section-hidden');
+            document.getElementById(`tab-${n}`).className = 'tab-inactive pb-3 font-medium transition-colors';
+        });
+    }
+
+    function renderCampaignInfoBar() {
+        const bar = document.getElementById('campaignInfoBar');
+        bar.innerHTML = `
+            <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+            </svg>
+            <span>Viewing campaign: <strong>${escHtml(currentCampaign.name)}</strong></span>
+            <span class="ml-auto text-blue-500 font-mono text-xs">${escHtml(currentCampaign.id)}</span>
+        `;
+    }
+
+    function renderStats(data) {
+        // CRM live fields: totalLeads (a.lead), totalCash (a.revenue), customer (conversions)
+        const totalLeads    = data.affiliates.reduce((s, a) => s + (a.totalLeads  || 0), 0);
+        const totalRevenue  = data.affiliates.reduce((s, a) => s + (a.totalCash   || 0), 0);
+        const currency      = data.affiliates.find(a => a.currency)?.currency || '';
+        const currencySymbol = currency === 'PKR' ? '₨' : currency === 'USD' ? '$' : (currency ? currency + ' ' : '$');
+
+        document.getElementById('stat-total-affiliates').textContent = data.affiliates.length;
+        document.getElementById('stat-leads-week').textContent       = totalLeads;
+        document.getElementById('stat-cash-week').textContent        = `${currencySymbol}${totalRevenue.toFixed(2)}`;
+        document.getElementById('stat-transactions').textContent     = data.transactions.length;
+    }
+
+    function renderRecentActivity(transactions) {
+        const tbody = document.getElementById('dashboard-recent-tbody');
+        if (!transactions.length) {
+            tbody.innerHTML = `<tr><td colspan="5" class="p-6 text-center text-gray-400">No transactions recorded yet.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = transactions.slice(0, 5).map(t => `
+            <tr class="hover:bg-gray-50">
+                <td class="p-4 text-xs text-gray-500">${new Date(t.createdAt).toLocaleString()}</td>
+                <td class="p-4 font-medium text-gray-900">${escHtml(t.affiliateName || t.contactId || '—')}</td>
+                <td class="p-4 font-mono text-xs text-gray-600">${escHtml(t.productId || '—')}</td>
+                <td class="p-4">
+                    <span class="px-2 py-1 rounded text-xs font-bold ${t.type === 'LEAD' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}">
+                        ${escHtml(t.type)}
+                    </span>
+                </td>
+                <td class="p-4 font-bold text-gray-900">${t.type === 'CASH' ? '$' + Number(t.amount).toFixed(2) : t.amount}</td>
+            </tr>
+        `).join('');
+    }
+
+    function renderAffiliates(affiliates) {
+        const tbody = document.getElementById('affiliates-tbody');
+        if (!affiliates.length) {
+            tbody.innerHTML = `<tr><td colspan="5" class="p-6 text-center text-gray-400">No affiliates in this campaign yet.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = affiliates.map(a => {
+            const currSym = a.currency === 'PKR' ? '₨' : a.currency === 'USD' ? '$' : (a.currency ? a.currency + ' ' : '$');
+            const statusBadge = a.active
+                ? `<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-green-100 text-green-700">Active</span>`
+                : `<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-gray-100 text-gray-500">Inactive</span>`;
+            return `
+            <tr class="hover:bg-gray-50">
+                <td class="p-4">
+                    <p class="font-medium text-gray-900">${escHtml(a.name || '—')}</p>
+                    <p class="text-xs text-gray-500">${escHtml(a.email || '')}</p>
+                </td>
+                <td class="p-4">${statusBadge}</td>
+                <td class="p-4 font-mono text-xs text-gray-600">${escHtml(a.refId || a.id)}</td>
+                <td class="p-4">
+                    <span class="text-blue-600 font-bold">${a.totalLeads ?? 0}</span>
+                    <span class="text-gray-400 text-xs"> leads / ${a.customer ?? 0} sales</span>
+                </td>
+                <td class="p-4">
+                    <span class="text-green-600 font-bold">${currSym}${Number(a.totalCash ?? 0).toFixed(2)}</span>
+                    <span class="text-gray-400 text-xs"> earned</span>
+                </td>
+            </tr>`;
+        }).join('');
+    }
+
+    function renderTransactions(transactions) {
+        const tbody = document.getElementById('transactions-tbody');
+        if (!transactions.length) {
+            tbody.innerHTML = `<tr><td colspan="5" class="p-6 text-center text-gray-400">No transactions recorded yet.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = transactions.map(t => `
+            <tr class="hover:bg-gray-50">
+                <td class="p-4 text-xs text-gray-500">${new Date(t.createdAt).toLocaleString()}</td>
+                <td class="p-4 font-medium text-gray-900">${escHtml(t.affiliateName || 'Unknown')}</td>
+                <td class="p-4 font-mono text-xs text-gray-600">${escHtml(t.productId || '—')}</td>
+                <td class="p-4">
+                    <span class="px-2 py-1 rounded text-xs font-bold ${t.type === 'LEAD' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}">
+                        ${escHtml(t.type)}
+                    </span>
+                </td>
+                <td class="p-4 font-bold text-gray-900">${t.type === 'CASH' ? '$' + Number(t.amount).toFixed(2) : t.amount}</td>
+            </tr>
+        `).join('');
+    }
+
+    function renderProducts(products) {
+        const container = document.getElementById('products-list');
+        if (!products.length) {
+            container.innerHTML = `<p class="text-gray-400 text-sm py-4">No products configured for this campaign yet.</p>`;
+            return;
+        }
+        container.innerHTML = products.map(p => `
+            <div class="border border-gray-200 p-4 rounded-lg flex flex-wrap items-center justify-between gap-4">
+                <div>
+                    <p class="font-bold text-gray-900">${escHtml(p.name)}</p>
+                    <p class="text-xs text-gray-500 mt-1">ID: ${escHtml(p.id)}</p>
+                </div>
+                <div class="flex items-center gap-3">
+                    <select id="select-${escHtml(p.id)}"
+                            class="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2.5 outline-none">
+                        <option value="CASH" ${p.payoutType === 'CASH' ? 'selected' : ''}>Cash Commission</option>
+                        <option value="LEAD" ${p.payoutType === 'LEAD' ? 'selected' : ''}>Lead Generation</option>
+                    </select>
+                    <input type="number" id="val-${escHtml(p.id)}"
+                           value="${p.payoutValue ?? ''}"
+                           placeholder="Amount / Count"
+                           class="w-36 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2.5 outline-none"
+                           min="0" step="0.01">
+                    <button onclick="saveRule('${escHtml(p.id)}', '${escHtml(p.name.replace(/'/g,"\\\'"))}', this)"
+                            class="bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm px-4 py-2.5 outline-none transition-colors">
+                        Save Rule
+                    </button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    // ── Save product rule ────────────────────────────────────────────────────
+    async function saveRule(productId, productName, btn) {
+        if (!currentCampaign) return alert('Select a campaign first.');
+        const type     = document.getElementById(`select-${productId}`).value;
+        const valInput = document.getElementById(`val-${productId}`).value;
+        const amount   = valInput ? parseFloat(valInput) : 0;
+        const ogText   = btn.textContent;
+        btn.textContent = 'Saving…';
+        btn.disabled = true;
+
+        try {
+            const res = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    locationId,
+                    campaignId:   currentCampaign.id,
+                    campaignName: currentCampaign.name,
+                    productId,
+                    productName,
+                    payoutType:   type,
+                    payoutValue:  amount
+                })
+            });
+            const body = await res.json();
+            if (!body.success) throw new Error(body.error || 'Save failed');
+            btn.textContent = 'Saved!';
+            btn.classList.replace('bg-blue-600', 'bg-green-600');
+            setTimeout(() => {
+                btn.textContent = ogText;
+                btn.classList.replace('bg-green-600', 'bg-blue-600');
+                btn.disabled = false;
+            }, 2000);
+        } catch (e) {
+            alert('Error saving rule: ' + e.message);
+            btn.textContent = ogText;
+            btn.disabled = false;
+        }
+    }
+
+    // ── Setup CRM custom fields for the current location ─────────────────────
+    async function setupCustomFields() {
+        if (!locationId) return alert('Select a location first.');
+        const btn    = document.getElementById('setupFieldsBtn');
+        const status = document.getElementById('setupFieldsStatus');
+        btn.disabled = true;
+        btn.textContent = 'Creating…';
+        status.textContent = '';
+        try {
+            const res  = await fetch(`/api/setup-custom-fields/${encodeURIComponent(locationId)}`, { method: 'POST' });
+            const body = await res.json();
+            if (!body.success) throw new Error(body.error || 'Setup failed');
+            const created  = body.created?.length      ? `Created: ${body.created.join(', ')}.`      : '';
+            const existing = body.alreadyExists?.length ? `Already set up: ${body.alreadyExists.join(', ')}.` : '';
+            const errors   = body.errors?.length        ? `Errors: ${body.errors.join('; ')}.`        : '';
+            status.textContent = [created, existing, errors].filter(Boolean).join(' ') || 'Done.';
+            btn.textContent = '✓ Fields Ready';
+            btn.classList.replace('bg-blue-600', 'bg-green-600');
+            btn.classList.replace('hover:bg-blue-700', 'hover:bg-green-700');
+        } catch (err) {
+            status.textContent = 'Error: ' + err.message;
+            btn.textContent = 'Create Custom Fields';
+            btn.disabled = false;
+        }
+    }
+
+    // ── Sync subscriptions from GHL ──────────────────────────────────────────
+    async function syncSubscriptions() {
+        if (!locationId) return alert('Select a location first.');
+        const btn    = document.getElementById('syncSubsBtn');
+        const status = document.getElementById('weeklyRunStatus');
+        btn.disabled = true;
+        btn.textContent = 'Syncing…';
+        status.textContent = '';
+        try {
+            const res  = await fetch(`/api/sync-subscriptions/${encodeURIComponent(locationId)}`, { method: 'POST' });
+            const body = await res.json();
+            if (!body.success) throw new Error(body.error || 'Sync failed');
+            const msg = `Synced ${body.rawCount} subscription(s) — ${body.added?.length || 0} new, ${body.updated?.length || 0} updated.`;
+            status.textContent = msg;
+            btn.textContent = '✓ Synced';
+            btn.classList.replace('bg-blue-600', 'bg-green-600');
+            btn.classList.replace('hover:bg-blue-700', 'hover:bg-green-700');
+            // Refresh the table
+            await loadWeeklyCheckStatus();
+            setTimeout(() => {
+                btn.textContent = 'Sync Subscriptions from GHL';
+                btn.classList.replace('bg-green-600', 'bg-blue-600');
+                btn.classList.replace('hover:bg-green-700', 'hover:bg-blue-700');
+                btn.disabled = false;
+            }, 4000);
+        } catch (err) {
+            status.textContent = 'Error: ' + err.message;
+            btn.textContent = 'Sync Subscriptions from GHL';
+            btn.disabled = false;
+        }
+    }
+
+    // ── Manually run renewal checks now ──────────────────────────────────────
+    async function runWeeklyCheck() {
+        const btn    = document.getElementById('weeklyRunBtn');
+        const status = document.getElementById('weeklyRunStatus');
+        const log    = document.getElementById('weeklyCheckLog');
+        btn.disabled = true;
+        btn.textContent = 'Running…';
+        status.textContent = '';
+        try {
+            const url = locationId
+                ? `/api/subscription-check/run?locationId=${encodeURIComponent(locationId)}`
+                : '/api/subscription-check/run';
+            const res  = await fetch(url, { method: 'POST' });
+            const body = await res.json();
+            if (!body.success) throw new Error(body.error || 'Check failed');
+            const checked = body.summary?.length || 0;
+            status.textContent = `Completed at ${new Date(body.runAt).toLocaleString()} — ${checked} subscription(s) checked.`;
+            renderCheckRunSummary(body.summary, body.runAt);
+            btn.textContent = '✓ Done';
+            setTimeout(() => {
+                btn.textContent = 'Run Check Now';
+                btn.disabled = false;
+                loadWeeklyCheckStatus();
+            }, 3000);
+        } catch (err) {
+            status.textContent = 'Error: ' + err.message;
+            btn.textContent = 'Run Check Now';
+            btn.disabled = false;
+        }
+    }
+
+    // ── Load and display per-subscription tracking status ────────────────────
+    async function loadWeeklyCheckStatus() {
+        const log = document.getElementById('weeklyCheckLog');
+        if (!log) return;
+        try {
+            const url = locationId
+                ? `/api/subscription-check/status?locationId=${encodeURIComponent(locationId)}`
+                : '/api/subscription-check/status';
+            const res  = await fetch(url);
+            const body = await res.json();
+
+            if (!body.tracked?.length) {
+                log.innerHTML = '<p class="text-gray-400 italic text-xs">No subscriptions synced yet. Click <strong>Sync Subscriptions from GHL</strong> to fetch your GHL subscriptions and match them to affiliates.</p>';
+                return;
+            }
+
+            // Split into affiliated vs unaffiliated
+            const affiliated   = body.tracked.filter(s => s.isAffiliated);
+            const unaffiliated = body.tracked.filter(s => !s.isAffiliated);
+
+            let html = '';
+
+            // ── Affiliated subscriptions table ──────────────────────────────
+            if (affiliated.length) {
+                html += `<h3 class="font-semibold text-gray-700 text-xs uppercase tracking-wide mb-2">Affiliated Subscriptions (${affiliated.length})</h3>
+                <div class="overflow-x-auto mb-4">
+                <table class="w-full text-left border-collapse text-xs">
+                    <thead>
+                        <tr class="bg-gray-50 text-gray-500">
+                            <th class="p-2 font-medium">Contact</th>
+                            <th class="p-2 font-medium">Affiliate</th>
+                            <th class="p-2 font-medium">Interval</th>
+                            <th class="p-2 font-medium">Status</th>
+                            <th class="p-2 font-medium">Renewal Date</th>
+                            <th class="p-2 font-medium">Next Check</th>
+                            <th class="p-2 font-medium">Checks</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-100">
+                    ${affiliated.map(s => {
+                        const nextDate  = s.nextCheckDate ? new Date(s.nextCheckDate) : null;
+                        const dueIn     = nextDate ? nextDate - Date.now() : null;
+                        const dueLabel  = s.stopped ? '<span class="text-gray-400">stopped</span>'
+                            : dueIn === null ? '—'
+                            : dueIn > 0 ? `in ${Math.ceil(dueIn / 3600000)}h`
+                            : '<span class="text-orange-500 font-semibold">due now</span>';
+                        const statusBadge = s.stopped
+                            ? `<span class="px-2 py-0.5 rounded-full bg-red-100 text-red-600 font-semibold">Stopped</span>`
+                            : s.isActive
+                                ? `<span class="px-2 py-0.5 rounded-full bg-green-100 text-green-700 font-semibold">Active</span>`
+                                : `<span class="px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-700 font-semibold">${escHtml(s.status || 'Unknown')}</span>`;
+                        const intervalLabel = { monthly: 'Monthly', yearly: 'Yearly', weekly: 'Weekly' }[s.billingInterval] || escHtml(s.billingInterval || '—');
+                        return `
+                        <tr class="hover:bg-gray-50">
+                            <td class="p-2 font-medium text-gray-900">${escHtml(s.contactName || s.contactEmail || s.ghlSubId)}<br><span class="text-gray-400 font-normal">${escHtml(s.contactEmail || '')}</span></td>
+                            <td class="p-2 text-blue-700 font-medium">${escHtml(s.affiliateName || '—')}</td>
+                            <td class="p-2"><span class="px-1.5 py-0.5 rounded bg-blue-50 text-blue-600">${intervalLabel}</span></td>
+                            <td class="p-2">${statusBadge}</td>
+                            <td class="p-2 text-gray-500">${s.renewalDate ? new Date(s.renewalDate).toLocaleDateString() : '—'}</td>
+                            <td class="p-2 text-gray-700">${nextDate ? nextDate.toLocaleDateString() : '—'} <span class="text-gray-400">(${dueLabel})</span></td>
+                            <td class="p-2 text-center text-gray-500">${s.checkCount || 0}</td>
+                        </tr>`;
+                    }).join('')}
+                    </tbody>
+                </table></div>`;
+            }
+
+            // ── Unaffiliated (for reference) ─────────────────────────────────
+            if (unaffiliated.length) {
+                html += `<details class="mt-2">
+                    <summary class="text-xs text-gray-400 cursor-pointer hover:text-gray-600">
+                        ${unaffiliated.length} unaffiliated subscription(s) — not tracked
+                    </summary>
+                    <div class="overflow-x-auto mt-2">
+                    <table class="w-full text-left border-collapse text-xs">
+                        <thead><tr class="bg-gray-50 text-gray-400">
+                            <th class="p-2 font-medium">Contact</th>
+                            <th class="p-2 font-medium">Interval</th>
+                            <th class="p-2 font-medium">Status</th>
+                            <th class="p-2 font-medium">Amount</th>
+                        </tr></thead>
+                        <tbody class="divide-y divide-gray-100">
+                        ${unaffiliated.map(s => `
+                        <tr class="hover:bg-gray-50 text-gray-500">
+                            <td class="p-2">${escHtml(s.contactName || s.contactEmail || s.ghlSubId)}</td>
+                            <td class="p-2">${escHtml(s.billingInterval || '—')}</td>
+                            <td class="p-2">${escHtml(s.status || '—')}</td>
+                            <td class="p-2">${s.currency || ''} ${s.amount || 0}</td>
+                        </tr>`).join('')}
+                        </tbody>
+                    </table></div>
+                </details>`;
+            }
+
+            // Last run log
+            if (body.log?.length) {
+                const last = body.log[0];
+                html += `<p class="text-gray-400 text-xs mt-3">Last check run: <strong class="text-gray-600">${new Date(last.runAt).toLocaleString()}</strong> — ${last.summary.length} subscription(s) processed.</p>`;
+            }
+
+            log.innerHTML = html;
+        } catch (e) {
+            console.error('loadWeeklyCheckStatus error:', e);
+        }
+    }
+
+    // ── Render the result of a manual check run ───────────────────────────────
+    function renderCheckRunSummary(summary, runAt) {
+        const log = document.getElementById('weeklyCheckLog');
+        if (!log) return;
+        if (!summary?.length) {
+            log.innerHTML = '<p class="text-gray-400 italic text-xs">No subscriptions were due for checking.</p>';
+            return;
+        }
+        const rows = summary.map(s => `
+            <div class="bg-gray-50 border border-gray-100 rounded-lg p-2 text-xs flex flex-wrap gap-3 items-start">
+                <div>
+                    <span class="font-medium text-gray-800">${escHtml(s.contactEmail || s.ghlSubId)}</span>
+                    <span class="text-gray-400 ml-1">(${escHtml(s.affiliateName || 'unaffiliated')} · ${escHtml(s.interval || '?')})</span>
+                </div>
+                <span class="text-gray-500">${escHtml(s.action || '')}</span>
+                ${s.crmUpdated ? '<span class="text-blue-600">✓ CRM updated</span>' : ''}
+                ${s.error     ? `<span class="text-red-500">⚠ ${escHtml(s.error)}</span>` : ''}
+                ${s.crmError  ? `<span class="text-orange-500">CRM: ${escHtml(s.crmError)}</span>` : ''}
+            </div>`).join('');
+        log.innerHTML = `<p class="font-semibold text-gray-700 text-xs mb-2">Run at: ${new Date(runAt).toLocaleString()}</p>` + rows;
+    }
+
+    // ── Utility ──────────────────────────────────────────────────────────────
+    function escHtml(str) {
+        return String(str ?? '')
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // ── Boot ─────────────────────────────────────────────────────────────────
+    boot();
+</script>
+</body>
+</html>
