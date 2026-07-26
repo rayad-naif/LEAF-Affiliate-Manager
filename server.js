@@ -627,6 +627,48 @@ function computeAffiliateCash(db, affiliateId, windowDays) {
         .reduce((sum, t) => sum + Number(t.amount || 0), 0);
 }
 
+// ─── Push an affiliate's current stats (leads/cash) to their CRM contact ─────
+// Shared by the renewal check AND a plain sync, so an affiliate's numbers in
+// GHL stay current no matter which path touched their subscription.
+async function pushAffiliateCustomFields(db, locationId, affiliateId) {
+    const customFieldIds = db.customFields?.[locationId] || {};
+    const affiliateRec   = db.affiliates?.[affiliateId];
+    if (!affiliateRec || !(customFieldIds.leads_this_week || customFieldIds.total_earned || customFieldIds.cash_this_week)) {
+        return { updated: false };
+    }
+
+    // Count active affiliated subscriptions as "leads" for this affiliate
+    const leadsCount = Object.values(db.trackedSubscriptions || {}).filter(s =>
+        s.affiliateId === affiliateId && s.isActive && !s.stopped
+    ).length;
+
+    // Always from LEAF's own local ledger, never GHL's native `revenue` figure —
+    // reconciling from locally-generated transaction records is the whole point.
+    const cashThisWeek = computeAffiliateCash(db, affiliateId, 7);
+    const cashTotal     = computeAffiliateCash(db, affiliateId, null);
+
+    // Prefer the affiliate's own GHL contactId; fall back to an email search
+    // and cache the result on the record so future calls skip the round trip.
+    let contactId = affiliateRec.contactId || null;
+    if (!contactId && affiliateRec.email) {
+        const contact = await searchContactByEmail(locationId, affiliateRec.email);
+        contactId = contact?.id || contact?._id || null;
+        if (contactId) affiliateRec.contactId = contactId;
+    }
+    if (!contactId) {
+        return { updated: false, error: `No contact found for affiliate ${affiliateRec.name || affiliateRec.email || affiliateId}` };
+    }
+
+    const fields = [];
+    if (customFieldIds.leads_this_week) fields.push({ id: customFieldIds.leads_this_week, key: 'leads_this_week', fieldValue: String(leadsCount) });
+    if (customFieldIds.cash_this_week)  fields.push({ id: customFieldIds.cash_this_week,  key: 'cash_this_week',  fieldValue: String(cashThisWeek) });
+    if (customFieldIds.total_earned)    fields.push({ id: customFieldIds.total_earned,    key: 'total_earned',    fieldValue: String(cashTotal) });
+    if (!fields.length) return { updated: false };
+
+    await updateContactCustomFields(locationId, contactId, fields);
+    return { updated: true, contactId, cashThisWeek, cashTotal, leadsCount };
+}
+
 // ─── Sync subscriptions from GHL and match to affiliates ─────────────────────
 // This is the core of the system.
 // Steps:
@@ -802,6 +844,27 @@ async function syncSubscriptionsFromGHL(locationId) {
 
     db.contactAffiliateMap = contactMap;
 
+    // ── Push fresh lead/cash stats to CRM for every affiliate touched here ──
+    // Previously only the hourly renewal check did this; a plain sync alone
+    // now keeps each matched affiliate's contact custom fields current too.
+    results.customFieldUpdates = [];
+    const touchedAffiliateIds = new Set(
+        Object.values(db.trackedSubscriptions)
+            .filter(s => s.locationId === locationId && s.isAffiliated && s.affiliateId)
+            .map(s => s.affiliateId)
+    );
+    for (const affId of touchedAffiliateIds) {
+        try {
+            const push = await pushAffiliateCustomFields(db, locationId, affId);
+            if (push.updated) results.customFieldUpdates.push(affId);
+            else if (push.error) results.errors.push({ ghlSubId: null, error: push.error });
+        } catch (err) {
+            const msg = err.response?.data?.message || err.message;
+            console.warn(`[sync-subs] custom field push failed for affiliate ${affId}:`, msg);
+            results.errors.push({ ghlSubId: null, error: `Custom field push failed for ${affId}: ${msg}` });
+        }
+    }
+
     try {
         saveDB(db);
     } catch (saveErr) {
@@ -809,7 +872,7 @@ async function syncSubscriptionsFromGHL(locationId) {
         results.errors.push({ ghlSubId: null, error: `Failed to persist database: ${saveErr.message}` });
     }
 
-    console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${results.errors.length} errors, ${fetchErrors.length} fetch failures, ${ghlSubs.length} total`);
+    console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${results.customFieldUpdates.length} CRM contacts updated, ${results.errors.length} errors, ${fetchErrors.length} fetch failures, ${ghlSubs.length} total`);
     return results;
 }
 
@@ -923,58 +986,20 @@ async function runSubscriptionChecks(locationIdFilter) {
                 }
 
                 // ── Push updated stats to CRM contact custom fields ─────────
-                const locationId     = tracked.locationId;
-                const customFieldIds = db.customFields?.[locationId] || {};
-                const affiliateRec   = Object.values(db.affiliates || {}).find(a => a.id === tracked.affiliateId);
-
-                if (affiliateRec && (customFieldIds.leads_this_week || customFieldIds.total_earned || customFieldIds.cash_this_week)) {
-                    try {
-                        // Count active affiliated subscriptions as "leads" for this affiliate
-                        const leadsCount = Object.values(db.trackedSubscriptions).filter(s =>
-                            s.affiliateId === tracked.affiliateId && s.isActive && !s.stopped
-                        ).length;
-
-                        // Cash earned in the last 7 days vs. all-time — always from
-                        // LEAF's own local ledger (never GHL's native `revenue`
-                        // figure). Reconciling from locally-generated transaction
-                        // records, not trusting GHL's own totals, is the entire
-                        // point of this system.
-                        const cashThisWeek = computeAffiliateCash(db, tracked.affiliateId, 7);
-                        const cashTotal     = computeAffiliateCash(db, tracked.affiliateId, null);
-
-                        // Prefer the affiliate's own GHL contactId when the affiliate-manager
-                        // API returned one — an email search can silently miss/mismatch when
-                        // the affiliate has no email set, or the email differs from their
-                        // contact record. Fall back to email search only if we don't have it.
-                        let contactId = affiliateRec.contactId || null;
-                        if (!contactId && affiliateRec.email) {
-                            const contact = await searchContactByEmail(locationId, affiliateRec.email);
-                            contactId = contact?.id || contact?._id || null;
-                        }
-
-                        if (contactId) {
-                            const fields = [];
-                            if (customFieldIds.leads_this_week)
-                                fields.push({ id: customFieldIds.leads_this_week, key: 'leads_this_week', fieldValue: String(leadsCount) });
-                            if (customFieldIds.cash_this_week)
-                                fields.push({ id: customFieldIds.cash_this_week, key: 'cash_this_week', fieldValue: String(cashThisWeek) });
-                            if (customFieldIds.total_earned)
-                                fields.push({ id: customFieldIds.total_earned, key: 'total_earned', fieldValue: String(cashTotal) });
-                            if (fields.length) {
-                                await updateContactCustomFields(locationId, contactId, fields);
-                                result.crmUpdated = true;
-                                result.crmContactId = contactId;
-                                result.cashThisWeek = cashThisWeek;
-                                result.cashTotal = cashTotal;
-                            }
-                        } else {
-                            result.crmError = `No contact found for affiliate ${affiliateRec.name || affiliateRec.email || tracked.affiliateId}`;
-                            console.warn(`[sub-check] ${result.crmError}`);
-                        }
-                    } catch (crmErr) {
-                        result.crmError = crmErr.response?.data?.message || crmErr.message;
-                        console.warn(`[sub-check] CRM update failed for ${affiliateRec?.email}:`, result.crmError);
+                try {
+                    const push = await pushAffiliateCustomFields(db, tracked.locationId, tracked.affiliateId);
+                    if (push.updated) {
+                        result.crmUpdated   = true;
+                        result.crmContactId = push.contactId;
+                        result.cashThisWeek = push.cashThisWeek;
+                        result.cashTotal     = push.cashTotal;
+                    } else if (push.error) {
+                        result.crmError = push.error;
+                        console.warn(`[sub-check] ${push.error}`);
                     }
+                } catch (crmErr) {
+                    result.crmError = crmErr.response?.data?.message || crmErr.message;
+                    console.warn(`[sub-check] CRM update failed for ${tracked.affiliateName}:`, result.crmError);
                 }
             }
 
