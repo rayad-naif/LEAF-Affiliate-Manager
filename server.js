@@ -306,6 +306,7 @@ function calcNextCheckDate(renewalDate) {
 }
 
 // ─── Sync subscriptions & Generate Transactions ──────────────────────────────
+/* STREAMING_CHUNK:Replacing syncSubscriptionsFromGHL... */
 async function syncSubscriptionsFromGHL(locationId) {
     const db = loadDB();
     if (!db.trackedSubscriptions) db.trackedSubscriptions = {};
@@ -316,107 +317,64 @@ async function syncSubscriptionsFromGHL(locationId) {
         fetchGHLAffiliates(locationId)
     ]);
 
-    const contactMap = { ...db.contactAffiliateMap };
-    const results = { locationId, added: [], updated: [], skipped: [], rawCount: ghlSubs.length };
+    const results = { locationId, added: [], updated: [], rawCount: ghlSubs.length };
 
     for (const sub of ghlSubs) {
         const ghlSubId    = sub._id || sub.id;
-        const subStripeId = sub.subscriptionId || ''; 
-        const contactId   = sub.contactId   || '';
-        const contactEmail = sub.contactEmail || '';
-        const status      = (typeof sub.status === 'object' ? sub.status?.status : sub.status) || 'unknown';
-
-        const productId = sub.recurringProduct?.product?._id || sub.productId;
-        const payloadAffId = sub.entitySourceMeta?.affiliateManager?.id || '';
+        const productId   = sub.recurringProduct?.product?._id || sub.productId;
         
-        let affiliateRec = null;
+        // 1. Identify Affiliate ID from the nested GHL payload
+        const payloadAffId = sub.entitySourceMeta?.affiliateManager?.id;
+        const affiliateRec = affiliates.find(a => a.id === payloadAffId || a.refId === payloadAffId);
 
-        // 1. Exact Match
-        if (payloadAffId) {
-            affiliateRec = Object.values(db.affiliates).find(a => a.id === payloadAffId || a.refId === payloadAffId);
-        }
-
-        // 2. Fuzzy Match (Strip special characters, numbers, and spaces)
-        if (!affiliateRec && payloadAffId) {
-            const cleanPayload = payloadAffId.replace(/[^a-zA-Z]/g, '').toLowerCase(); // e.g. "examplealex"
-            if (cleanPayload.length >= 3) {
-                affiliateRec = Object.values(db.affiliates).find(a => {
-                    const cleanName = (a.name || '').replace(/[^a-zA-Z]/g, '').toLowerCase(); // e.g. "examplealexdoecarter"
-                    const cleanEmail = (a.email || '').split('@')[0].replace(/[^a-zA-Z]/g, '').toLowerCase();
-                    return (cleanName && (cleanName.includes(cleanPayload) || cleanPayload.includes(cleanName))) ||
-                           (cleanEmail && (cleanEmail.includes(cleanPayload) || cleanPayload.includes(cleanEmail)));
-                });
-            }
-        }
-
-        // 3. Contact Fallback Map
-        if (!affiliateRec) {
-            let affiliateEntry = contactMap[contactId] || (contactEmail && contactMap[contactEmail]) || null;
-            if (affiliateEntry) affiliateRec = Object.values(db.affiliates).find(a => a.id === affiliateEntry.affiliateId);
-        }
-
-        // Remember the contact mapping for the future
-        if (affiliateRec && contactId) {
-            contactMap[contactId] = { affiliateId: affiliateRec.id, affiliateName: affiliateRec.name, locationId };
-        }
-
-        // FORCE GENERATE MISSING INITIAL TRANSACTION
+        // 2. Force Generate Transaction if it's the first time we see this
         const txId = `tx_sync_${ghlSubId}`;
-        const existingTx = db.transactions[txId];
-        
-        if (!existingTx && productId) {
-            const rule = db.products[productId];
-            
-            // If we matched an affiliate OR there is a custom rule to apply
-            if (rule && rule.payoutValue > 0) {
-                db.transactions[txId] = {
-                    id: txId, 
-                    campaignId: rule.campaignId || affiliateRec?.campaignId || 'unknown',
-                    contactId: contactId,
-                    affiliateId: affiliateRec?.id || payloadAffId || null,
-                    affiliateName: affiliateRec?.name || payloadAffId || 'Unknown Affiliate',
-                    productId: productId,
-                    subscriptionId: ghlSubId,
-                    type: rule.payoutType || 'CASH',
-                    amount: rule.payoutValue,
-                    createdAt: sub.createdAt || new Date().toISOString()
-                };
-            }
+        const rule = db.products[productId];
+
+        if (affiliateRec && rule && !db.transactions[txId]) {
+            db.transactions[txId] = {
+                id: txId,
+                campaignId: rule.campaignId,
+                contactId: sub.contactId,
+                affiliateId: affiliateRec.id,
+                affiliateName: affiliateRec.name,
+                productId: productId,
+                subscriptionId: ghlSubId,
+                type: rule.payoutType || 'CASH',
+                amount: rule.payoutValue || 0,
+                createdAt: sub.createdAt || new Date().toISOString()
+            };
+            saveDB(db);
         }
 
+        // 3. Save Tracking Record
         const billingInterval = detectBillingInterval(sub);
-        const intervalMs      = intervalToMs(billingInterval);
         const createdAt       = sub.createdAt || new Date().toISOString();
-        const rawPeriodEnd    = sub.currentPeriodEnd || sub.nextBillingDate || null;
-        const periodEndMs     = rawPeriodEnd ? new Date(rawPeriodEnd).getTime() : new Date(createdAt).getTime() + intervalMs;
-        const renewalDate     = new Date(periodEndMs).toISOString();
+        const renewalDate     = sub.currentPeriodEnd || new Date(new Date(createdAt).getTime() + intervalToMs(billingInterval)).toISOString();
         const nextCheckDate   = calcNextCheckDate(renewalDate);
-
+        
         const existing = db.trackedSubscriptions[ghlSubId];
-
-        const record = {
-            ghlSubId, stripeSubId: subStripeId, contactId, contactEmail, contactName: sub.contactName || '', locationId,
-            affiliateId: affiliateRec?.id || payloadAffId || null,
-            affiliateName: affiliateRec?.name || payloadAffId || null,
-            isAffiliated: !!affiliateRec || !!payloadAffId,
-            billingInterval, amount: sub.amount || 0, currency: sub.currency || 'USD', status, isActive: status === 'active',
-            startDate: existing?.startDate || createdAt, renewalDate, 
+        db.trackedSubscriptions[ghlSubId] = {
+            ghlSubId,
+            contactId: sub.contactId,
+            affiliateId: affiliateRec?.id || null,
+            affiliateName: affiliateRec?.name || null,
+            isAffiliated: !!affiliateRec,
+            billingInterval,
+            status: (typeof sub.status === 'object' ? sub.status?.status : sub.status) || 'unknown',
+            isActive: (typeof sub.status === 'object' ? sub.status?.status : sub.status) === 'active',
+            renewalDate,
             nextCheckDate: existing?.nextCheckDate || nextCheckDate,
-            lastChecked: existing?.lastChecked || null, checkCount: existing?.checkCount || 0, stopped: existing?.stopped || false
+            checkCount: existing?.checkCount || 0,
+            stopped: existing?.stopped || false
         };
 
-        if (existing?.nextCheckDate && !existing?.stopped) record.nextCheckDate = existing.nextCheckDate;
-
-        db.trackedSubscriptions[ghlSubId] = record;
-        if (!existing) results.added.push({ ghlSubId, contact: contactEmail || contactId, affiliated: record.isAffiliated });
+        if (!existing) results.added.push(ghlSubId);
         else results.updated.push(ghlSubId);
     }
-
-    db.contactAffiliateMap = contactMap;
     saveDB(db);
     return results;
 }
-
 // ─── Per-subscription renewal check ──────────────────────────────────────────
 async function runSubscriptionChecks(locationIdFilter) {
     const db  = loadDB();
@@ -525,57 +483,34 @@ app.get('/api/campaigns/:locationId', async (req, res) => {
     }
 });
 
+/* STREAMING_CHUNK:Replacing dashboard API route... */
 app.get('/api/dashboard/:campaignId', async (req, res) => {
     const { campaignId } = req.params;
     const { locationId } = req.query;
     const db = loadDB();
 
-    if (locationId) {
-        try {
-            const [affiliates, products] = await Promise.all([fetchGHLAffiliates(locationId), fetchGHLProducts(locationId)]);
-            affiliates.forEach(a => { db.affiliates[a.id] = { ...db.affiliates[a.id], ...a }; });
-            products.forEach(p => { db.products[p.id] = p; });
-            saveDB(db);
-        } catch (err) { }
-    }
-
     const campaign   = db.campaigns[campaignId];
-    const affiliates = Object.values(db.affiliates).filter(a => (Array.isArray(a.campaignIds) && a.campaignIds.includes(campaignId)) || a.campaignId === campaignId );
-    const products = Object.values(db.products).filter(p => p.locationId === locationId || p.campaignId === campaignId || (!p.campaignId && p.locationId === (campaign?.locationId || locationId)) );
-
+    const affiliates = Object.values(db.affiliates).filter(a => a.campaignId === campaignId);
+    
+    // Get all transactions for this campaign
     const allCampaignTxns = Object.values(db.transactions).filter(t => t.campaignId === campaignId);
 
-    // FUZZY DASHBOARD MATCHING OVERRIDE
+    // Precise calculation: Aggregate stats based on Affiliate ID
     affiliates.forEach(aff => {
-        const cleanAffName = (aff.name || '').replace(/[^a-zA-Z]/g, '').toLowerCase();
-        const cleanAffEmail = (aff.email || '').split('@')[0].replace(/[^a-zA-Z]/g, '').toLowerCase();
-
-        const affTxns = allCampaignTxns.filter(t => {
-            // 1. Strict ID Match
-            if (t.affiliateId && t.affiliateId === aff.id) return true;
-            
-            // 2. Fuzzy Name/Email Match
-            const rawTxName = t.affiliateName || t.affiliateId || '';
-            const cleanTxName = rawTxName.replace(/[^a-zA-Z]/g, '').toLowerCase();
-            
-            if (cleanTxName.length >= 3 && cleanAffName.length >= 3) {
-                if (cleanAffName.includes(cleanTxName) || cleanTxName.includes(cleanAffName)) return true;
-            }
-            if (cleanTxName.length >= 3 && cleanAffEmail.length >= 3) {
-                if (cleanAffEmail.includes(cleanTxName) || cleanTxName.includes(cleanAffEmail)) return true;
-            }
-            return false;
-        });
+        const affTxns = allCampaignTxns.filter(t => t.affiliateId === aff.id);
         
         aff.totalCash  = affTxns.filter(t => t.type === 'CASH').reduce((sum, t) => sum + Number(t.amount || 0), 0);
         aff.totalLeads = affTxns.filter(t => t.type === 'LEAD').reduce((sum, t) => sum + Number(t.amount || 0), 0);
-        aff.customer   = affTxns.length > 0 ? affTxns.length : (aff.customer || 0);
+        aff.customer   = affTxns.length; // Count of successful transaction events
     });
 
-    const recentTransactions = allCampaignTxns.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50);
-    res.json({ success: true, affiliates, transactions: recentTransactions, products, campaign: campaign || null });
+    res.json({ 
+        success: true, 
+        affiliates, 
+        transactions: allCampaignTxns.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt)), 
+        campaign 
+    });
 });
-
 app.post('/api/settings', (req, res) => {
     const { locationId, campaignId, campaignName, productId, productName, payoutType, payoutValue, sheetId } = req.body;
     const db = loadDB();
