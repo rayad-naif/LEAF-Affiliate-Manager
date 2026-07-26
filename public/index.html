@@ -487,12 +487,16 @@
                 select.appendChild(opt);
             });
 
-            updateDiagnostics(`/api/campaigns/${locationId}`, 'ok', `${campaigns.length} campaign(s) from ${body.source}`);
+            updateDiagnostics(`/api/campaigns/${locationId}`, body.warning ? 'warning' : 'ok', body.warning || `${campaigns.length} campaign(s) from ${body.source}`);
 
             // Show source badge
+            badge.title = body.warning || '';
             if (body.source === 'local') {
                 badge.textContent = 'Local cache';
                 badge.className = 'text-xs px-2 py-1 rounded-full font-medium bg-amber-100 text-amber-700';
+            } else if (body.source === 'crm-partial') {
+                badge.textContent = 'Partial sync ⚠';
+                badge.className = 'text-xs px-2 py-1 rounded-full font-medium bg-orange-100 text-orange-700 cursor-help';
             } else {
                 badge.textContent = 'Live from CRM';
                 badge.className = 'text-xs px-2 py-1 rounded-full font-medium bg-green-100 text-green-700';
@@ -569,7 +573,7 @@
             if (!data.success) throw new Error(data.error || 'Failed to load data');
             dashboardData = data;
             renderAll(data);
-            updateDiagnostics(`/api/dashboard/${currentCampaign.id}`, 'ok');
+            updateDiagnostics(`/api/dashboard/${currentCampaign.id}`, data.syncWarning ? 'warning' : 'ok', data.syncWarning);
         } catch (err) {
             console.error('refreshDashboard error:', err);
             updateDiagnostics(`/api/dashboard/${currentCampaign.id}`, 'error', err.message);
@@ -869,7 +873,10 @@
             const res  = await fetch(`/api/sync-subscriptions/${encodeURIComponent(locationId)}`, { method: 'POST' });
             const body = await res.json();
             if (!body.success) throw new Error(body.error || 'Sync failed');
-            const msg = `Synced ${body.rawCount} subscription(s) — ${body.added?.length || 0} new, ${body.updated?.length || 0} updated.`;
+            let msg = `Synced ${body.rawCount} subscription(s) — ${body.added?.length || 0} new, ${body.updated?.length || 0} updated.`;
+            if (body.fetchErrors?.length) {
+                msg += ` ⚠ Some sources failed and were skipped: ${body.fetchErrors.join('; ')}`;
+            }
             status.textContent = msg;
             btn.textContent = '✓ Synced';
             btn.classList.replace('bg-blue-600', 'bg-green-600');
