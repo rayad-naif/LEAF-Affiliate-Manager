@@ -313,6 +313,58 @@
     let   currentCampaign = null;   // { id, name }
     let   dashboardData   = null;   // latest fetched data
 
+    // ── SSO: ask the GHL parent window for the current location/user context ──
+    // GHL Marketplace Custom Pages don't put locationId in the iframe's own
+    // URL (unlike agency-configured Custom Menu Links), so urlLocId above will
+    // almost always be empty when this app is opened from inside GHL. This is
+    // the actual mechanism GHL uses instead: post a request to the parent
+    // window, and it replies with an encrypted payload containing the current
+    // location. Standalone/local testing (no GHL parent) will just time out —
+    // that's expected, and boot() falls back to the location picker below.
+    function requestSSOKey() {
+        return new Promise((resolve, reject) => {
+            window.parent.postMessage({ message: 'REQUEST_USER_DATA' }, '*');
+
+            const timeout = setTimeout(() => {
+                window.removeEventListener('message', listener);
+                reject(new Error('SSO response timed out (not running inside GHL?)'));
+            }, 6000);
+
+            function listener(event) {
+                if (event.data?.message === 'REQUEST_USER_DATA_RESPONSE') {
+                    clearTimeout(timeout);
+                    window.removeEventListener('message', listener);
+                    resolve(event.data.payload);
+                }
+            }
+            window.addEventListener('message', listener);
+        });
+    }
+
+    // Resolves the current locationId via SSO. Returns null (never throws) so
+    // callers can just fall back to the location picker on any failure.
+    async function resolveLocationViaSSO() {
+        try {
+            updateDiagnostics('SSO', 'loading');
+            const ssoKey = await requestSSOKey();
+            const res  = await fetch('/sso/decrypt', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ key: ssoKey })
+            });
+            const body = await res.json();
+            if (!body.success || !body.data?.activeLocation) {
+                throw new Error(body.error || 'No active location in SSO context');
+            }
+            updateDiagnostics('SSO', 'ok', body.data.activeLocation);
+            return body.data.activeLocation;
+        } catch (err) {
+            console.warn('SSO location resolution failed:', err.message);
+            updateDiagnostics('SSO', 'error', err.message);
+            return null;
+        }
+    }
+
     // ── Tab switching ────────────────────────────────────────────────────────
     function switchTab(tabName) {
         ['dashboard', 'affiliates', 'transactions', 'settings'].forEach(name => {
@@ -336,7 +388,9 @@
         hideLoading();
 
         if (urlLocId) {
-            // CRM iframe context — location is fixed; show badge, hide picker
+            // Explicit ?locationId= in the URL (e.g. an agency-configured
+            // Custom Menu Link using a {{location.id}} merge tag) — location
+            // is fixed; show badge, hide picker.
             locationId = urlLocId;
             const badge = document.getElementById('locationBadge');
             document.getElementById('locationBadgeText').textContent = locationId;
@@ -344,11 +398,26 @@
             badge.classList.add('flex');
             await loadCampaigns();
             startAutoSync();
-        } else {
-            // Standalone context — show location picker
-            showEmptyState();
-            await loadLocations();
+            return;
         }
+
+        // No locationId in the URL — try resolving it via GHL's SSO
+        // postMessage flow (the normal case for a Marketplace Custom Page).
+        const ssoLocationId = await resolveLocationViaSSO();
+        if (ssoLocationId) {
+            locationId = ssoLocationId;
+            const badge = document.getElementById('locationBadge');
+            document.getElementById('locationBadgeText').textContent = locationId;
+            badge.classList.remove('hidden');
+            badge.classList.add('flex');
+            await loadCampaigns();
+            startAutoSync();
+            return;
+        }
+
+        // Neither worked — standalone/dev context. Show the location picker.
+        showEmptyState();
+        await loadLocations();
     }
 
     // ── Load installed locations ─────────────────────────────────────────────
