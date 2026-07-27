@@ -2136,11 +2136,8 @@ app.listen(PORT, '0.0.0.0', () => {
 // IMPORTANT: Place this at the VERY END of server.js, 
 // after all your API routes (app.get('/api/...), etc.)
 app.get('*', (req, res) => {
-    // Check if the file exists (DEBUGGING STEP)
-    const indexPath = path.join(__dirname, 'public', 'index.html');
-    
-    // Send the file
-    res.sendFile(indexPath);
+    console.log("Catch-all triggered for:", req.path);
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 // 3. Listen last
