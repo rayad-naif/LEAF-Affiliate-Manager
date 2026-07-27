@@ -3,6 +3,7 @@ const axios    = require('axios');
 const fs       = require('fs');
 const path     = require('path');
 const cron     = require('node-cron');
+const crypto   = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -55,6 +56,11 @@ const GHL_API_VER_PRODUCTS = '2021-07-28';  // products
 const GHL_TOKEN_URL        = `${GHL_API_BASE}/oauth/token`;
 const GHL_LOC_TOKEN_URL    = `${GHL_API_BASE}/oauth/location-token`;
 const GHL_INSTALLED_LOCS   = `${GHL_API_BASE}/oauth/installedLocations`;
+
+// Shared Secret from the Marketplace app's Advanced Settings → Auth section.
+// Used only to decrypt the SSO payload GHL posts into Custom Page iframes
+// (see /sso/decrypt below) — never sent to the frontend.
+const GHL_SHARED_SECRET = process.env.GHL_SHARED_SECRET;
 
 function ghlHeaders(accessToken, version = GHL_API_VER) {
     return {
@@ -126,7 +132,34 @@ function loadDB() {
 // Synchronous from the caller's point of view — updates the in-memory copy
 // immediately, then persists in the background (Redis, or local file if
 // Redis isn't configured).
+//
+// MAX_TRANSACTIONS keeps the transactions log from growing forever. Every
+// other collection in the DB (installs, campaigns, products, affiliates) is
+// naturally bounded by real-world counts — how many accounts install the
+// app, how many products/campaigns/affiliates they set up. Transactions are
+// different: it's an append-only log of every purchase event, ever, with no
+// natural ceiling. Left untrimmed, that log is what eventually pushes the
+// single JSON blob toward Upstash's 256MB free-tier storage cap (and toward
+// response sizes large enough to get truncated mid-transfer, which shows up
+// client-side as exactly the "Unexpected end of JSON input" error). This
+// keeps only the most recent MAX_TRANSACTIONS records, system-wide, on
+// every save — cheap to check, and only sorts/trims when actually over cap.
+const MAX_TRANSACTIONS = parseInt(process.env.MAX_TRANSACTIONS || '5000', 10);
+
+function pruneTransactions(db) {
+    if (!db.transactions) return;
+    const ids = Object.keys(db.transactions);
+    if (ids.length <= MAX_TRANSACTIONS) return;
+    const sorted = ids
+        .map(id => ({ id, createdAt: db.transactions[id]?.createdAt || '' }))
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const toRemove = sorted.slice(MAX_TRANSACTIONS);
+    toRemove.forEach(({ id }) => { delete db.transactions[id]; });
+    console.log(`[db] Pruned ${toRemove.length} old transaction(s), keeping the ${MAX_TRANSACTIONS} most recent`);
+}
+
 function saveDB(db) {
+    pruneTransactions(db);
     dbCache = db;
     if (DB_PERSISTENT) {
         axios.post(`${REDIS_URL}/set/${DB_KEY}`, JSON.stringify(db), {
@@ -1664,12 +1697,80 @@ app.get('/oauth/callback/lc', async (req, res) => {
     }
 });
 
+// ─── SSO: decrypt the postMessage payload from GHL Custom Page iframes ───────
+// GHL Marketplace Custom Pages don't put locationId in the iframe's URL — the
+// only way to learn who's actually looking at the page is this SSO flow:
+// the frontend asks the GHL parent window (via postMessage) for the current
+// user/location context, GHL replies with an AES-256-CBC-encrypted, base64
+// payload, and this endpoint decrypts it using the app's Shared Secret
+// (Marketplace → App Settings → Advanced Settings → Auth). The encryption is
+// CryptoJS's OpenSSL-compatible "Salted__" format with EVP_BytesToKey (MD5)
+// key derivation — this replicates that using Node's built-in crypto module.
+function evpBytesToKey(password, salt, keyLen = 32, ivLen = 16) {
+    let d = Buffer.alloc(0);
+    let keyIv = Buffer.alloc(0);
+    while (keyIv.length < keyLen + ivLen) {
+        d = crypto.createHash('md5').update(Buffer.concat([d, password, salt])).digest();
+        keyIv = Buffer.concat([keyIv, d]);
+    }
+    return { key: keyIv.subarray(0, keyLen), iv: keyIv.subarray(keyLen, keyLen + ivLen) };
+}
+
+function decryptSSOPayload(encryptedData, sharedSecret) {
+    const raw = Buffer.from(encryptedData, 'base64');
+    if (raw.subarray(0, 8).toString('utf8') !== 'Salted__') {
+        throw new Error("Invalid SSO payload: missing 'Salted__' header");
+    }
+    const salt       = raw.subarray(8, 16);
+    const ciphertext = raw.subarray(16);
+    const { key, iv } = evpBytesToKey(Buffer.from(sharedSecret, 'utf8'), salt);
+    const decipher    = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    const plaintext   = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return JSON.parse(plaintext.toString('utf8'));
+}
+
+// ─── API: Decrypt the SSO payload sent from index.html ───────────────────────
+app.post('/sso/decrypt', (req, res) => {
+    const { key } = req.body || {};
+    if (!key) {
+        return res.status(400).json({ success: false, error: 'Missing SSO key' });
+    }
+    if (!GHL_SHARED_SECRET) {
+        console.error('[sso] GHL_SHARED_SECRET is not set — cannot decrypt SSO payloads');
+        return res.status(500).json({ success: false, error: 'SSO is not configured on the server' });
+    }
+    try {
+        const data = decryptSSOPayload(key, GHL_SHARED_SECRET);
+        return res.json({ success: true, data });
+    } catch (err) {
+        console.error('[sso] Decryption failed:', err.message);
+        return res.status(400).json({ success: false, error: 'Failed to decrypt SSO payload' });
+    }
+});
+
 // ─── API: List installed locations ────────────────────────────────────────────
+// Requires ?locationId=... in the URL. Previously this returned every
+// installed account's locationId/companyId with no filtering at all — any
+// customer's frontend calling this endpoint could see every OTHER
+// customer's location and company IDs. Now it only ever returns the single
+// install matching the locationId passed in, and returns nothing at all if
+// the URL doesn't include one.
 app.get('/api/locations', (req, res) => {
+    const { locationId } = req.query;
+    if (!locationId) {
+        return res.json({ success: true, locations: [] });
+    }
     const db = loadDB();
-    const locations = Object.values(db.installs)
-        .filter(i => i.locationId && !i.locationId.startsWith('company_'))
-        .map(i => ({ locationId: i.locationId, companyId: i.companyId || null, userId: i.userId || null, installedAt: i.installedAt || null }));
+    const install = db.installs[locationId];
+    if (!install || !install.locationId) {
+        return res.json({ success: true, locations: [] });
+    }
+    const locations = [{
+        locationId: install.locationId,
+        companyId:  install.companyId  || null,
+        userId:     install.userId     || null,
+        installedAt: install.installedAt || null
+    }];
     return res.json({ success: true, locations });
 });
 
@@ -2307,6 +2408,9 @@ if (!process.env.GHL_APP_ID) {
 }
 if (!DB_PERSISTENT) {
     console.warn(`[startup] WARNING: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not set — leaf_database.json (which holds every OAuth access/refresh token) lives at ${DB_FILE}, on the default disk. On Render, this disk is EPHEMERAL: a free-tier spin-down/spin-up or any redeploy wipes it, deleting every stored refresh token and forcing users to reinstall from the GHL Marketplace to reconnect. Fix: create a free Upstash Redis database (upstash.com) and set those two env vars — no further code changes needed beyond that.`);
+}
+if (!GHL_SHARED_SECRET) {
+    console.warn('[startup] WARNING: GHL_SHARED_SECRET is not set. The frontend will not be able to resolve locationId via SSO for Marketplace Custom Pages (POST /sso/decrypt will return 500) — it will fall back to the (locationId-gated, empty-by-default) location picker instead.');
 }
 
 // Pull the DB down from Redis (or local file) before accepting any traffic,
