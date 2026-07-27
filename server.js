@@ -2123,19 +2123,7 @@ app.get('/health', (req, res) => {
 });
 // This acts as a "Smart" filter.
 // It serves index.html ONLY for requests that aren't APIs or OAuth callbacks.
-app.get('*', (req, res, next) => {
-    // 1. Define paths that MUST NOT be hijacked by the frontend
-    const protectedPaths = ['/api', '/oauth', '/webhook', '/health'];
-    
-    // 2. If the request starts with any protected path, let the actual API route handle it
-    if (protectedPaths.some(path => req.path.startsWith(path))) {
-        return next();
-    }
-    
-    // 3. Otherwise, serve your frontend app
-    console.log("Serving frontend for path:", req.path);
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
+
 const PORT = process.env.PORT || 5000;
 if (!process.env.GHL_APP_ID) {
     console.warn('[startup] WARNING: GHL_APP_ID is not set. Company/Agency-level OAuth installs will resolve 0 locations until this is configured (GET /oauth/installedLocations requires it).');
