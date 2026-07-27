@@ -64,38 +64,42 @@ function ghlHeaders(accessToken, version = GHL_API_VER) {
     };
 }
 
-// ─── JSON file store ──────────────────────────────────────────────────────────
-// WHERE THIS FILE LIVES MATTERS A LOT ON RENDER (or any host with an
+// ─── Persistent store (Upstash Redis) ────────────────────────────────────────
+// WHERE THIS DATA LIVES MATTERS A LOT ON RENDER (or any host with an
 // ephemeral filesystem): every OAuth token — company AND location, access
-// AND refresh — lives in this one JSON file. Render's free/starter web
-// services have NO persistent disk by default: the local filesystem is
-// wiped on every restart, including the spin-up after a free-tier
-// spin-down from inactivity, and every redeploy. If this file sits in the
-// default location (next to server.js, on that ephemeral disk), a
-// spin-down silently deletes every stored refresh token — which is exactly
-// what forces "reinstall from the GHL Marketplace" to get working tokens
-// again, since there's no refresh token left to silently renew from.
+// AND refresh — lives in this one JSON blob. Render's free-tier web services
+// have NO persistent disk option at all, so writing to the local filesystem
+// gets wiped on every restart — including the spin-up after a free-tier
+// spin-down from inactivity, and every redeploy. That would silently delete
+// every stored refresh token, forcing a "reinstall from the GHL Marketplace"
+// to get working tokens again.
 //
-// Fix: mount a Render Persistent Disk and point DATA_DIR at its mount path
-// (Render Dashboard → your service → Disks → Add Disk, e.g. mounted at
-// /var/data, then set the env var DATA_DIR=/var/data). With that in place,
-// the token refresh logic below (getOrCreateLocationToken / 401 handling
-// in ghlApiRequest) already silently re-authenticates on every request
-// using the persisted refresh token — no user action, no marketplace
-// reinstall, ever required, spin-down or not. Without a persistent disk,
-// no amount of token-refresh logic can survive the file being deleted out
-// from under it.
-const DATA_DIR       = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
-const DB_PERSISTENT  = !!process.env.DATA_DIR;
+// Fix: store the JSON blob in Upstash Redis (upstash.com — free tier, no
+// disk needed, works on Render's free plan) instead of on local disk.
+//   1. Create a free Redis database at upstash.com
+//   2. Copy its REST URL + REST token
+//   3. Set env vars: UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
+//   4. Redeploy
+// The database is kept in memory (dbCache) for the lifetime of the process —
+// every existing loadDB()/saveDB() call site below is untouched and stays
+// synchronous. saveDB() updates the in-memory copy immediately and pushes
+// the new blob to Redis in the background. On boot, initDB() pulls the
+// latest blob down from Redis before the server starts accepting traffic.
+// If the env vars aren't set (e.g. local dev), everything falls back to the
+// old local-file behavior automatically.
+const REDIS_URL     = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
+const DB_PERSISTENT = !!(REDIS_URL && REDIS_TOKEN);
+const DB_KEY        = 'leaf_database';
+
+// Local-file fallback, used only when Upstash env vars aren't set (local dev)
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
 if (process.env.DATA_DIR && !fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 const DB_FILE = path.join(DATA_DIR, 'leaf_database.json');
 
-function loadDB() {
-    if (fs.existsSync(DB_FILE)) {
-        try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch {}
-    }
+function defaultDB() {
     return {
         campaigns: {}, settings: {}, products: {}, affiliates: {}, transactions: {},
         installs: {}, customFields: {},
@@ -107,8 +111,57 @@ function loadDB() {
     };
 }
 
+let dbCache = null; // populated by initDB() before the server starts listening
+
+// Synchronous — every existing call site keeps working unchanged.
+function loadDB() {
+    if (dbCache) return dbCache;
+    // Shouldn't happen (initDB runs before app.listen), but guard anyway.
+    if (fs.existsSync(DB_FILE)) {
+        try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch {}
+    }
+    return defaultDB();
+}
+
+// Synchronous from the caller's point of view — updates the in-memory copy
+// immediately, then persists in the background (Redis, or local file if
+// Redis isn't configured).
 function saveDB(db) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+    dbCache = db;
+    if (DB_PERSISTENT) {
+        axios.post(`${REDIS_URL}/set/${DB_KEY}`, JSON.stringify(db), {
+            headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'text/plain' }
+        }).catch(err => {
+            console.error('[db] Failed to persist to Upstash Redis:', err.message);
+        });
+    } else {
+        try { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); } catch (err) {
+            console.error('[db] Failed to persist to local file:', err.message);
+        }
+    }
+}
+
+// Pulls the latest blob down from Redis (or local file) into dbCache. Must
+// complete before app.listen() so the very first request sees real data.
+async function initDB() {
+    if (DB_PERSISTENT) {
+        try {
+            const res = await axios.get(`${REDIS_URL}/get/${DB_KEY}`, {
+                headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+            });
+            const raw = res.data && res.data.result;
+            dbCache = raw ? JSON.parse(raw) : defaultDB();
+        } catch (err) {
+            console.error('[db] Failed to load from Upstash Redis, starting from an empty DB:', err.message);
+            dbCache = defaultDB();
+        }
+    } else {
+        if (fs.existsSync(DB_FILE)) {
+            try { dbCache = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch { dbCache = defaultDB(); }
+        } else {
+            dbCache = defaultDB();
+        }
+    }
 }
 
 // Migrate old DB on load — add missing top-level keys without losing existing data
@@ -121,10 +174,9 @@ function migrateDB() {
     if (!db.autoRefreshLog)       { db.autoRefreshLog       = []; dirty = true; }
     if (dirty) saveDB(db);
 }
-migrateDB();
 
 // Seed demo data on first run
-(function seedDB() {
+function seedDB() {
     const db  = loadDB();
     const loc = 'HjiMUOsCCHCjtxEf8PR';
     if (db.campaigns['camp_1']) return;
@@ -152,7 +204,7 @@ migrateDB();
         trans_4: { id: 'trans_4', campaignId: 'camp_2', contactId: 'Contact_004', affiliateName: 'Alex Rivera', productId: 'prod_3', type: 'CASH', amount: 200, createdAt: daysAgo(1) }
     });
     saveDB(db);
-})();
+}
 
 // ─── Token helpers ────────────────────────────────────────────────────────────
 function isTokenExpired(install) {
@@ -2240,11 +2292,11 @@ app.get('/health', (req, res) => {
         time:    new Date().toISOString(),
         callbackUrl: process.env.GHL_REDIRECT_URI || '(redirect URI not set)',
         ghlAppIdConfigured: !!process.env.GHL_APP_ID,
-        dbPath: DB_FILE,
+        dbStore: DB_PERSISTENT ? 'Upstash Redis' : `local file (${DB_FILE})`,
         dbPersistent: DB_PERSISTENT,
         warning: [
             process.env.GHL_APP_ID ? null : 'GHL_APP_ID is not set — Company/Agency-level installs will resolve 0 locations. Set it and use POST /api/admin/resolve-locations/:companyId to fix existing installs.',
-            DB_PERSISTENT ? null : 'DATA_DIR is not set — the token database lives on the default (ephemeral) disk. On Render (or similar hosts), a spin-down/restart or redeploy will WIPE all stored OAuth tokens, forcing a full reinstall from the GHL Marketplace. Mount a Render Persistent Disk and set DATA_DIR to its path to fix this permanently.'
+            DB_PERSISTENT ? null : 'UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not set — the token database lives on the default (ephemeral) local disk. On Render (or similar hosts), a spin-down/restart or redeploy will WIPE all stored OAuth tokens, forcing a full reinstall from the GHL Marketplace. Set up a free Upstash Redis database and set those two env vars to fix this permanently.'
         ].filter(Boolean).join(' | ') || undefined
     });
 });
@@ -2254,9 +2306,19 @@ if (!process.env.GHL_APP_ID) {
     console.warn('[startup] WARNING: GHL_APP_ID is not set. Company/Agency-level OAuth installs will resolve 0 locations until this is configured (GET /oauth/installedLocations requires it).');
 }
 if (!DB_PERSISTENT) {
-    console.warn(`[startup] WARNING: DATA_DIR is not set — leaf_database.json (which holds every OAuth access/refresh token) lives at ${DB_FILE}, on the default disk. On Render, this disk is EPHEMERAL: a free-tier spin-down/spin-up or any redeploy wipes it, deleting every stored refresh token and forcing users to reinstall from the GHL Marketplace to reconnect. Fix: add a Render Persistent Disk and set the DATA_DIR env var to its mount path (e.g. DATA_DIR=/var/data) — no code changes needed beyond that.`);
+    console.warn(`[startup] WARNING: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not set — leaf_database.json (which holds every OAuth access/refresh token) lives at ${DB_FILE}, on the default disk. On Render, this disk is EPHEMERAL: a free-tier spin-down/spin-up or any redeploy wipes it, deleting every stored refresh token and forcing users to reinstall from the GHL Marketplace to reconnect. Fix: create a free Upstash Redis database (upstash.com) and set those two env vars — no further code changes needed beyond that.`);
 }
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'} | DB: ${DB_FILE} (persistent: ${DB_PERSISTENT})`);
-    runBootSyncOnce();
+
+// Pull the DB down from Redis (or local file) before accepting any traffic,
+// then run the one-time migration/seed steps against it.
+initDB().then(() => {
+    migrateDB();
+    seedDB();
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'} | DB store: ${DB_PERSISTENT ? 'Upstash Redis' : DB_FILE}`);
+        runBootSyncOnce();
+    });
+}).catch(err => {
+    console.error('[startup] initDB failed unexpectedly:', err.message);
+    process.exit(1);
 });
