@@ -2121,9 +2121,7 @@ app.get('/health', (req, res) => {
         warning: process.env.GHL_APP_ID ? undefined : 'GHL_APP_ID is not set — Company/Agency-level installs will resolve 0 locations. Set it and use POST /api/admin/resolve-locations/:companyId to fix existing installs.'
     });
 });
-// This acts as a "Smart" filter.
-// It serves index.html ONLY for requests that aren't APIs or OAuth callbacks.
-
+ 
 const PORT = process.env.PORT || 5000;
 if (!process.env.GHL_APP_ID) {
     console.warn('[startup] WARNING: GHL_APP_ID is not set. Company/Agency-level OAuth installs will resolve 0 locations until this is configured (GET /oauth/installedLocations requires it).');
@@ -2132,5 +2130,4 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'}`);
     runBootSyncOnce();
 });
-
 
