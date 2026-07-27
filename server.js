@@ -2136,10 +2136,13 @@ app.listen(PORT, '0.0.0.0', () => {
 // IMPORTANT: Place this at the VERY END of server.js, 
 // after all your API routes (app.get('/api/...), etc.)
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    // Check if the file exists (DEBUGGING STEP)
+    const indexPath = path.join(__dirname, 'public', 'index.html');
+    
+    // Send the file
+    res.sendFile(indexPath);
 });
 
+// 3. Listen last
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`LEAF Server running on port ${PORT}`));
-```
-
