@@ -23,6 +23,30 @@ app.use((req, res, next) => {
     next();
 });
 
+// ─── Static marketing pages ───────────────────────────────────────────────────
+// A single index.html lives at the project root (same directory as
+// server.js) — separate from public/index.html, which is the admin
+// dashboard app served by express.static above. It needs to load at
+// /home, /privacy, /terms, and /support.
+//
+// Registered as individual explicit-path routes rather than a static mount
+// or a catch-all, specifically so this can never shadow /oauth/callback/lc
+// (or any other API route): Express matches these on the exact path only,
+// so there's zero overlap with /oauth/*, /api/*, or /webhook/* regardless
+// of where this block sits relative to those route registrations.
+// To add another marketing path later, just add it to this list.
+const ROOT_INDEX_FILE   = path.join(__dirname, 'index.html');
+const ROOT_INDEX_ROUTES = ['/home', '/privacy', '/terms', '/support'];
+ROOT_INDEX_ROUTES.forEach(route => {
+    app.get(route, (req, res) => {
+        if (!fs.existsSync(ROOT_INDEX_FILE)) {
+            console.error(`[static] ${route} requested but index.html not found at ${ROOT_INDEX_FILE}`);
+            return res.status(404).send('index.html not found in project root.');
+        }
+        res.sendFile(ROOT_INDEX_FILE);
+    });
+});
+
 // ─── CRM API constants ────────────────────────────────────────────────────────
 const GHL_API_BASE         = 'https://services.leadconnectorhq.com';
 const GHL_API_VER          = '2021-04-15';  // installedLocations
@@ -1283,6 +1307,41 @@ async function fetchInstalledLocationsForCompany(companyToken, companyId) {
     return locIds;
 }
 
+// ─── GHL: All sub-accounts under an agency (Company) ─────────────────────────
+// Endpoint: GET /locations/search  Version: v3
+// Fallback for when /oauth/installedLocations comes back empty. That
+// endpoint only lists locations with an "isInstalled" flag for THIS specific
+// app — which only ever gets set when the app is bulk-installed per
+// sub-account. An app whose "Who can install" / distribution is Agency-level
+// can be authorized once at the Company level with NO per-location install
+// records created at all (the Company token can already mint a location
+// token for any of the agency's sub-accounts on demand) — so
+// installedLocations legitimately, silently returns zero locations even
+// though the agency has real, usable sub-accounts. This lists the agency's
+// actual sub-accounts directly instead, and — unlike installedLocations —
+// doesn't depend on GHL_APP_ID being configured at all.
+async function fetchLocationsForCompany(companyToken, companyId) {
+    const allLocs = [];
+    let skip = 0;
+    const limit = 100;
+
+    while (true) {
+        const res = await axios.get(`${GHL_API_BASE}/locations/search`, {
+            params: { companyId, limit, skip },
+            headers: { 'Authorization': `Bearer ${companyToken}`, 'Version': GHL_API_VER_V3, 'Accept': 'application/json' },
+            timeout: 10000
+        });
+        const page = res.data?.locations || res.data?.data || [];
+        allLocs.push(...page);
+        if (page.length < limit) break;
+        skip += limit;
+    }
+
+    const locIds = allLocs.map(l => l.locationId || l._id || l.id).filter(Boolean);
+    console.log(`[oauth] locations/search returned ${locIds.length} sub-account(s) for company ${companyId}`);
+    return locIds;
+}
+
 // ─── API: Manually re-resolve + token-exchange locations for a company ───────
 // Use this after an install shows "0 locations" (e.g. GHL_APP_ID was missing
 // at install time and has since been fixed, or a new sub-account was added to
@@ -1299,7 +1358,29 @@ app.post('/api/admin/resolve-locations/:companyId', async (req, res) => {
         let companyToken = companyInstall.accessToken;
         if (isTokenExpired(companyInstall)) companyToken = await refreshCompanyToken(companyId);
 
-        const locIds = await fetchInstalledLocationsForCompany(companyToken, companyId);
+        let locIds = [];
+        let resolveWarning = null;
+        try {
+            locIds = await fetchInstalledLocationsForCompany(companyToken, companyId);
+        } catch (ilErr) {
+            resolveWarning = ilErr.response?.data?.message || ilErr.message;
+            console.error('[resolve-locations] installedLocations fetch failed:', ilErr.response?.data || ilErr.message);
+        }
+
+        // Same fallback as the OAuth callback: an Agency-level install can
+        // have zero per-location "isInstalled" records, so fall back to the
+        // agency's actual sub-account list — this also doesn't need
+        // GHL_APP_ID, so it can recover even when that's what failed above.
+        if (locIds.length === 0) {
+            try {
+                locIds = await fetchLocationsForCompany(companyToken, companyId);
+                if (locIds.length > 0) resolveWarning = null;
+            } catch (searchErr) {
+                console.error('[resolve-locations] locations/search fallback failed:', searchErr.response?.data || searchErr.message);
+                if (!resolveWarning) resolveWarning = searchErr.response?.data?.message || searchErr.message;
+            }
+        }
+
         const resolved = [];
         const errors = [];
 
@@ -1320,7 +1401,7 @@ app.post('/api/admin/resolve-locations/:companyId', async (req, res) => {
             }
         }
         saveDB(db);
-        res.json({ success: true, resolvedLocations: resolved, total: locIds.length, errors });
+        res.json({ success: true, resolvedLocations: resolved, total: locIds.length, errors, warning: locIds.length === 0 ? resolveWarning : undefined });
     } catch (err) {
         console.error('[resolve-locations] error:', err.response?.data || err.message);
         res.status(500).json({ success: false, error: err.response?.data?.message || err.message });
@@ -1391,6 +1472,22 @@ app.get('/oauth/callback/lc', async (req, res) => {
                 } catch (ilErr) {
                     locationResolveError = ilErr.response?.data?.message || ilErr.message;
                     console.error('[oauth] installedLocations fetch failed:', ilErr.response?.data || ilErr.message);
+                }
+            }
+
+            // installedLocations only lists locations with a per-location
+            // "isInstalled" flag for this app — an Agency-distributed install
+            // can be authorized at the Company level with none of those
+            // records ever created, so a 0-result (or a hard failure, e.g.
+            // GHL_APP_ID missing) here doesn't mean the agency has no usable
+            // locations. Fall back to listing its actual sub-accounts.
+            if (locIds.length === 0) {
+                try {
+                    locIds = await fetchLocationsForCompany(access_token, companyId);
+                    if (locIds.length > 0) locationResolveError = null;
+                } catch (searchErr) {
+                    console.error('[oauth] locations/search fallback failed:', searchErr.response?.data || searchErr.message);
+                    if (!locationResolveError) locationResolveError = searchErr.response?.data?.message || searchErr.message;
                 }
             }
 
@@ -2121,7 +2218,7 @@ app.get('/health', (req, res) => {
         warning: process.env.GHL_APP_ID ? undefined : 'GHL_APP_ID is not set — Company/Agency-level installs will resolve 0 locations. Set it and use POST /api/admin/resolve-locations/:companyId to fix existing installs.'
     });
 });
- 
+
 const PORT = process.env.PORT || 5000;
 if (!process.env.GHL_APP_ID) {
     console.warn('[startup] WARNING: GHL_APP_ID is not set. Company/Agency-level OAuth installs will resolve 0 locations until this is configured (GET /oauth/installedLocations requires it).');
@@ -2130,4 +2227,3 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'}`);
     runBootSyncOnce();
 });
-
