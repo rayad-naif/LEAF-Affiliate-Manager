@@ -2121,7 +2121,11 @@ app.get('/health', (req, res) => {
         warning: process.env.GHL_APP_ID ? undefined : 'GHL_APP_ID is not set — Company/Agency-level installs will resolve 0 locations. Set it and use POST /api/admin/resolve-locations/:companyId to fix existing installs.'
     });
 });
-
+app.get('*', (req, res) => {
+    console.log("Catch-all triggered for:", req.path);
+    // Use path.join(__dirname, 'index.html') if your file is in the root
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
 const PORT = process.env.PORT || 5000;
 if (!process.env.GHL_APP_ID) {
     console.warn('[startup] WARNING: GHL_APP_ID is not set. Company/Agency-level OAuth installs will resolve 0 locations until this is configured (GET /oauth/installedLocations requires it).');
@@ -2131,15 +2135,4 @@ app.listen(PORT, '0.0.0.0', () => {
     runBootSyncOnce();
 });
 
-// ... existing code ...
 
-// IMPORTANT: Place this at the VERY END of server.js, 
-// after all your API routes (app.get('/api/...), etc.)
-app.get('*', (req, res) => {
-    console.log("Catch-all triggered for:", req.path);
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
-
-// 3. Listen last
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => console.log(`LEAF Server running on port ${PORT}`));
