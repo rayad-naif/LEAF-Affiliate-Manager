@@ -65,7 +65,32 @@ function ghlHeaders(accessToken, version = GHL_API_VER) {
 }
 
 // ─── JSON file store ──────────────────────────────────────────────────────────
-const DB_FILE = path.join(__dirname, 'leaf_database.json');
+// WHERE THIS FILE LIVES MATTERS A LOT ON RENDER (or any host with an
+// ephemeral filesystem): every OAuth token — company AND location, access
+// AND refresh — lives in this one JSON file. Render's free/starter web
+// services have NO persistent disk by default: the local filesystem is
+// wiped on every restart, including the spin-up after a free-tier
+// spin-down from inactivity, and every redeploy. If this file sits in the
+// default location (next to server.js, on that ephemeral disk), a
+// spin-down silently deletes every stored refresh token — which is exactly
+// what forces "reinstall from the GHL Marketplace" to get working tokens
+// again, since there's no refresh token left to silently renew from.
+//
+// Fix: mount a Render Persistent Disk and point DATA_DIR at its mount path
+// (Render Dashboard → your service → Disks → Add Disk, e.g. mounted at
+// /var/data, then set the env var DATA_DIR=/var/data). With that in place,
+// the token refresh logic below (getOrCreateLocationToken / 401 handling
+// in ghlApiRequest) already silently re-authenticates on every request
+// using the persisted refresh token — no user action, no marketplace
+// reinstall, ever required, spin-down or not. Without a persistent disk,
+// no amount of token-refresh logic can survive the file being deleted out
+// from under it.
+const DATA_DIR       = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
+const DB_PERSISTENT  = !!process.env.DATA_DIR;
+if (process.env.DATA_DIR && !fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+const DB_FILE = path.join(DATA_DIR, 'leaf_database.json');
 
 function loadDB() {
     if (fs.existsSync(DB_FILE)) {
@@ -2215,7 +2240,12 @@ app.get('/health', (req, res) => {
         time:    new Date().toISOString(),
         callbackUrl: process.env.GHL_REDIRECT_URI || '(redirect URI not set)',
         ghlAppIdConfigured: !!process.env.GHL_APP_ID,
-        warning: process.env.GHL_APP_ID ? undefined : 'GHL_APP_ID is not set — Company/Agency-level installs will resolve 0 locations. Set it and use POST /api/admin/resolve-locations/:companyId to fix existing installs.'
+        dbPath: DB_FILE,
+        dbPersistent: DB_PERSISTENT,
+        warning: [
+            process.env.GHL_APP_ID ? null : 'GHL_APP_ID is not set — Company/Agency-level installs will resolve 0 locations. Set it and use POST /api/admin/resolve-locations/:companyId to fix existing installs.',
+            DB_PERSISTENT ? null : 'DATA_DIR is not set — the token database lives on the default (ephemeral) disk. On Render (or similar hosts), a spin-down/restart or redeploy will WIPE all stored OAuth tokens, forcing a full reinstall from the GHL Marketplace. Mount a Render Persistent Disk and set DATA_DIR to its path to fix this permanently.'
+        ].filter(Boolean).join(' | ') || undefined
     });
 });
 
@@ -2223,7 +2253,10 @@ const PORT = process.env.PORT || 5000;
 if (!process.env.GHL_APP_ID) {
     console.warn('[startup] WARNING: GHL_APP_ID is not set. Company/Agency-level OAuth installs will resolve 0 locations until this is configured (GET /oauth/installedLocations requires it).');
 }
+if (!DB_PERSISTENT) {
+    console.warn(`[startup] WARNING: DATA_DIR is not set — leaf_database.json (which holds every OAuth access/refresh token) lives at ${DB_FILE}, on the default disk. On Render, this disk is EPHEMERAL: a free-tier spin-down/spin-up or any redeploy wipes it, deleting every stored refresh token and forcing users to reinstall from the GHL Marketplace to reconnect. Fix: add a Render Persistent Disk and set the DATA_DIR env var to its mount path (e.g. DATA_DIR=/var/data) — no code changes needed beyond that.`);
+}
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'}`);
+    console.log(`LEAF Server running on port ${PORT} | Subscription Tracker v2 | callback: ${process.env.GHL_REDIRECT_URI || '(not set)'} | DB: ${DB_FILE} (persistent: ${DB_PERSISTENT})`);
     runBootSyncOnce();
 });
