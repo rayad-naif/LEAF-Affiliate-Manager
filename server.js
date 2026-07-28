@@ -462,16 +462,38 @@ async function fetchGHLCampaigns(locationId) {
 // page, given the current cursor (`null` for the first page) and the page
 // size. `getItems(res)` extracts that page's array of items from the
 // response.
+// Safety caps for paginated GHL fetches (subscriptions, transactions,
+// affiliates, products, campaigns). Without these, an account with a large
+// history pages through EVERY record, sequentially, on every single sync —
+// which is exactly what was turning "Sync Subscriptions" into a multi-minute
+// request. Render's free tier has a limited request/memory budget, so a long
+// enough sync would get its connection cut mid-response — which shows up in
+// the browser as a truncated body ("Unexpected end of JSON input"), not as a
+// clean error. FETCH_MAX_PAGES bounds how much a single sync will ever try
+// to pull in one go; FETCH_PAGE_DELAY_MS spaces requests out a little so
+// GHL's API isn't hit back-to-back (on top of the existing 429 retry/backoff
+// below). Both are overridable via env vars if a location genuinely needs
+// more.
+const FETCH_MAX_PAGES     = parseInt(process.env.FETCH_MAX_PAGES     || '50', 10);  // 50 pages × 100/page = 5,000 records
+const FETCH_PAGE_DELAY_MS = parseInt(process.env.FETCH_PAGE_DELAY_MS || '150', 10);
+
 async function fetchAllPagesCursor(requestPage, getItems, limit = 100) {
     const all = [];
     let cursor = null;
+    let pageCount = 0;
 
     while (true) {
         const res  = await requestPage(cursor, limit);
         const page = getItems(res) || [];
         all.push(...page);
+        pageCount++;
 
         if (page.length < limit) break; // last page
+
+        if (pageCount >= FETCH_MAX_PAGES) {
+            console.warn(`[pagination] Hit the ${FETCH_MAX_PAGES}-page safety cap (${all.length} records fetched) — stopping early this sync. Raise FETCH_MAX_PAGES if this location genuinely has more records than that.`);
+            break;
+        }
 
         const meta = res.data?.meta || {};
         const last = page[page.length - 1] || {};
@@ -480,6 +502,8 @@ async function fetchAllPagesCursor(requestPage, getItems, limit = 100) {
 
         if (!startAfterId) break; // no cursor to advance with — stop rather than loop forever
         cursor = { startAfter, startAfterId };
+
+        if (FETCH_PAGE_DELAY_MS > 0) await sleep(FETCH_PAGE_DELAY_MS);
     }
 
     return all;
@@ -970,18 +994,42 @@ async function syncSubscriptionsFromGHL(locationId) {
 
     // Push fresh leads/cash-this-week/total-earned stats to CRM for every
     // affiliate touched by this sync — once each, not once per subscription.
-    results.crmPushed = [];
-    for (const affId of affiliatesToPush) {
-        const push = await pushAffiliateStatsToCRM(db, locationId, affId);
-        if (push.success) {
-            results.crmPushed.push({ affiliateId: affId, contactId: push.contactId });
-        } else {
-            results.errors.push({ ghlSubId: null, error: `CRM push failed for affiliate ${affId}: ${push.error}` });
-        }
+    // This now runs in the BACKGROUND (fire-and-forget), after saveDB()
+    // above: each push is its own network round-trip to GHL, and awaiting
+    // them one-by-one here was exactly what turned "Sync Subscriptions"
+    // into a multi-minute request for accounts with many affiliates —
+    // long enough that Render's free tier would sometimes cut the
+    // connection mid-response, which shows up client-side as "Unexpected
+    // end of JSON input" rather than a clean error. The subscription data
+    // itself is already saved by the time this kicks off, so the
+    // dashboard is accurate immediately; the CRM custom fields catch up
+    // moments later. See server logs (prefix "[sync-subs] background")
+    // for push results.
+    results.crmPushed = []; // kept for response-shape compatibility; pushes happen after this returns
+    if (affiliatesToPush.size > 0) {
+        pushAffiliateStatsInBackground(locationId, [...affiliatesToPush]);
     }
 
-    console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${results.errors.length} errors, ${fetchErrors.length} fetch failures, ${ghlSubs.length} total`);
+    console.log(`[sync-subs] ${locationId}: ${results.added.length} added, ${results.updated.length} updated, ${results.errors.length} errors, ${fetchErrors.length} fetch failures, ${ghlSubs.length} total, ${affiliatesToPush.size} CRM push(es) queued in background`);
     return results;
+}
+
+// Runs the per-affiliate CRM stats push without blocking the caller. Errors
+// are logged, not thrown — by the time this runs, the HTTP response for
+// whatever sync triggered it has likely already been sent to the browser.
+async function pushAffiliateStatsInBackground(locationId, affiliateIds) {
+    const db = loadDB();
+    let pushed = 0, failed = 0;
+    for (const affId of affiliateIds) {
+        try {
+            const push = await pushAffiliateStatsToCRM(db, locationId, affId);
+            if (push.success) pushed++; else failed++;
+        } catch (err) {
+            failed++;
+            console.error(`[sync-subs] background CRM push failed for affiliate ${affId}:`, err.message);
+        }
+    }
+    console.log(`[sync-subs] background CRM push complete for ${locationId}: ${pushed} succeeded, ${failed} failed`);
 }
 
 // ─── Per-subscription renewal check ──────────────────────────────────────────
